@@ -74,6 +74,33 @@ Only runs started through the Runs API get interactive approvals. Hermes'
 `/v1/responses` and chat endpoints treat API clients as unattended and deny
 flagged commands outright, which is why the bridge now uses `/v1/runs`.
 
+## Status ring
+
+A thin gauge runs around the edge of the agent screen, with a gap at the bottom
+for the status bar. **Tap the status bar** to open the full Hermes status page;
+any tap or button closes it.
+
+| Ring colour | Meaning |
+| --- | --- |
+| Green | Hermes healthy (`/health/detailed` reports ok) |
+| Amber | Hermes up but degraded (e.g. a readiness check failing) |
+| Red | Bridge can't reach Hermes |
+| Grey track only | No data yet, or data is **stale** (older than 3× `STATUS_INTERVAL_S`) |
+
+The ring's length is today's remaining token budget when `DAILY_TOKEN_BUDGET` is
+set in `bridge/.env`; with no budget it stays full and only the colour matters.
+
+The status page shows: health, tokens used today (big number), budget left,
+time until the daily reset (local midnight in the container — set its timezone),
+active runs, enabled scheduled jobs, tokens per agent slot for its current
+session, and how long ago it was updated. Until the first update arrives it says
+"waiting for bridge…" rather than showing zeros, and old data is labelled STALE
+in amber, never presented as live.
+
+Token counts come from the `usage` Hermes reports when each run finishes, so
+they cover work started from the watch, not from other clients. They're saved in
+`bridge/usage.json` and survive bridge restarts.
+
 ## Power saving
 
 | State | When | Screen | CPU | Wi-Fi |
@@ -154,13 +181,14 @@ The ESP32-S3 only does 2.4 GHz Wi-Fi — make sure your SSID has a 2.4 GHz band.
 
 ## Credits
 
-The approval state machine (`lib/vibe_approval`), the pop-up layout, and the
-power-saving scheme (`lib/vibe_power`) are adapted
+The approval state machine (`lib/vibe_approval`), the pop-up layout, the
+power-saving scheme (`lib/vibe_power`), and the status snapshot with stale
+detection (`lib/vibe_status`, from its `vibe_quota`) are adapted
 from [neilshare/vibewatch](https://github.com/neilshare/vibewatch) (MIT), itself a
 fork of [GOROman/vibewatch](https://github.com/GOROman/vibewatch).
 
 ## Tests
 
 ```bash
-python3 -m platformio test -e native   # approval + power state machines, run on your PC
+python3 -m platformio test -e native   # approval, power and status logic, run on your PC
 ```

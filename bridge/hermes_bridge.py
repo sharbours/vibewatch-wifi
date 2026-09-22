@@ -28,6 +28,7 @@ import os
 import re
 import time
 from collections import deque
+from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -83,6 +84,11 @@ REJECT_TEXT = os.getenv("REJECT_TEXT", "No, don't do that. Stop and wait for my 
 # "expired" (= deny) arrives before Hermes gives up on its own.
 APPROVAL_TTL_S = int(os.getenv("APPROVAL_TTL_S", "240"))
 APPROVAL_SPEAK = os.getenv("APPROVAL_SPEAK", "1") not in ("0", "false", "no")
+
+# Status ring / page on the watch
+STATUS_INTERVAL_S = int(os.getenv("STATUS_INTERVAL_S", "30"))
+DAILY_TOKEN_BUDGET = int(os.getenv("DAILY_TOKEN_BUDGET", "0"))  # 0 = no budget, ring stays full
+USAGE_FILE = Path(os.getenv("USAGE_FILE", str(Path(__file__).with_name("usage.json"))))
 
 AGENT_COUNT = 6
 MIC_RATE = 16000
@@ -238,6 +244,32 @@ class Hermes:
         except httpx.HTTPError:
             return False
 
+    async def snapshot(self) -> dict:
+        """Health, active runs and enabled jobs. Never raises; 'offline' on failure."""
+        snap = {"health": "offline", "runs": None, "jobs": 0}
+        try:
+            r = await self.http.get("/health/detailed")
+            if r.status_code == 200:
+                data = r.json()
+                snap["health"] = "ok" if data.get("status") == "ok" else "degraded"
+                runs = find_key(data, "active_api_runs")
+                if isinstance(runs, int):
+                    snap["runs"] = runs
+            elif await self.health():
+                snap["health"] = "ok"  # older Hermes without /health/detailed
+        except (httpx.HTTPError, ValueError):
+            return snap
+        try:
+            r = await self.http.get("/api/jobs")
+            if r.status_code == 200:
+                jobs = r.json().get("jobs", [])
+                snap["jobs"] = sum(1 for j in jobs if isinstance(j, dict)
+                                   and j.get("enabled", True) and not j.get("paused_at")
+                                   and j.get("state") != "paused")
+        except (httpx.HTTPError, ValueError, AttributeError):
+            pass
+        return snap
+
     async def supports_approvals(self) -> bool:
         try:
             r = await self.http.get("/v1/capabilities")
@@ -246,6 +278,86 @@ class Hermes:
                         or feats.get("approval_events"))
         except (httpx.HTTPError, ValueError):
             return False
+
+
+# ---------------------------------------------------------------------------
+# Status: token ledger + Hermes health, pushed to watches as "host.status"
+# ---------------------------------------------------------------------------
+
+
+def seconds_to_local_midnight() -> int:
+    now = datetime.now().astimezone()
+    midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return max(0, int((midnight - now).total_seconds()))
+
+
+class UsageLedger:
+    """Tokens used today (local time) in total and per Hermes session; survives restarts."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.day = datetime.now().astimezone().date().isoformat()
+        self.total = 0
+        self.sessions: dict[str, int] = {}
+        try:
+            data = json.loads(path.read_text())
+            if data.get("day") == self.day:
+                self.total = int(data.get("total", 0))
+                self.sessions = {k: int(v) for k, v in data.get("sessions", {}).items()}
+        except (OSError, ValueError):
+            pass
+
+    def _roll(self) -> None:
+        today = datetime.now().astimezone().date().isoformat()
+        if today != self.day:
+            self.day, self.total, self.sessions = today, 0, {}
+
+    def add(self, session_id: str, usage: dict | None) -> None:
+        if not isinstance(usage, dict):
+            return
+        tokens = usage.get("total_tokens")
+        if not isinstance(tokens, (int, float)) or tokens <= 0:
+            tokens = sum(v for k, v in usage.items()
+                         if k in ("input_tokens", "output_tokens") and isinstance(v, (int, float)))
+        tokens = int(tokens)
+        if tokens <= 0:
+            return
+        self._roll()
+        self.total += tokens
+        self.sessions[session_id] = self.sessions.get(session_id, 0) + tokens
+        try:
+            self.path.write_text(json.dumps({"day": self.day, "total": self.total, "sessions": self.sessions}))
+        except OSError as exc:
+            log.warning("could not save %s: %s", self.path, exc)
+
+    def today(self) -> int:
+        self._roll()
+        return self.total
+
+    def session(self, session_id: str) -> int:
+        self._roll()
+        return self.sessions.get(session_id, 0)
+
+
+def find_key(obj, key: str):
+    """First value for `key` anywhere in nested dicts/lists (Hermes' readiness shape varies)."""
+    if isinstance(obj, dict):
+        if key in obj:
+            return obj[key]
+        for v in obj.values():
+            found = find_key(v, key)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for v in obj:
+            found = find_key(v, key)
+            if found is not None:
+                return found
+    return None
+
+
+LEDGER = UsageLedger(USAGE_FILE)
+HERMES_SNAPSHOT: dict = {"health": None, "runs": None, "jobs": 0}
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +454,28 @@ class Device:
     async def set_state(self, idx: int, state: str) -> None:
         self.slots[idx].state = state
         await self.push_status()
+
+    async def push_host_status(self) -> None:
+        if HERMES_SNAPSHOT["health"] is None:
+            return  # nothing measured yet: the watch keeps showing "no data"
+        today = LEDGER.today()
+        remaining = 100.0
+        if DAILY_TOKEN_BUDGET > 0:
+            remaining = max(0.0, 100.0 * (1 - today / DAILY_TOKEN_BUDGET))
+        runs = HERMES_SNAPSHOT["runs"]
+        if runs is None:
+            runs = sum(1 for i in range(AGENT_COUNT) if self.busy(i))
+        await self.send_json({"method": "host.status", "params": {
+            "health": HERMES_SNAPSHOT["health"],
+            "runs": runs,
+            "jobs": HERMES_SNAPSHOT["jobs"],
+            "tokens_today": today,
+            "budget": DAILY_TOKEN_BUDGET,
+            "remaining_pct": round(remaining, 1),
+            "reset_s": seconds_to_local_midnight(),
+            "slot_tokens": [LEDGER.session(self.session_id(i)) for i in range(AGENT_COUNT)],
+            "ttl_s": max(30, STATUS_INTERVAL_S * 3),
+        }})
 
     async def show_label(self, text: str) -> None:
         await self.send_json({"method": "host.focused_app", "params": {"appName": text[:18]}})
@@ -563,6 +697,8 @@ class Device:
                 await self.drop_approval(rid, notify_watch=True)
 
         name = terminal.get("event")
+        LEDGER.add(self.session_id(idx), terminal.get("usage"))
+        await self.push_host_status()
         await self.show_label("Hermes")
         if name == "run.completed":
             return str(terminal.get("output") or "").strip() or "Done."
@@ -610,6 +746,7 @@ class Device:
             if ok and not await self.hermes.supports_approvals():
                 log.warning("This Hermes build does not advertise run approvals; update Hermes.")
             await self.show_label("Hermes" if ok else "Hermes offline")
+            await self.push_host_status()
             # Re-show an approval that was open when Wi-Fi dropped.
             await self.show_current_approval(announce=False)
         elif m == "voice.start":
@@ -707,6 +844,15 @@ async def main() -> None:
         log.warning("Hermes at %s does not advertise run approvals; pop-ups won't appear", HERMES_URL)
 
     devices: dict[str, Device] = {}
+
+    async def status_poller() -> None:
+        while True:
+            HERMES_SNAPSHOT.update(await hermes.snapshot())
+            for dev in list(devices.values()):
+                await dev.push_host_status()
+            await asyncio.sleep(STATUS_INTERVAL_S)
+
+    poller = asyncio.create_task(status_poller())  # noqa: F841 (kept alive for the process)
 
     async def handler(ws: ServerConnection) -> None:
         headers = ws.request.headers

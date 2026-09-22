@@ -1,0 +1,7 @@
+{
+  "name": "vibe_status",
+  "version": "1.0.0",
+  "description": "Hermes status snapshot with freshness tracking (hardware independent)",
+  "frameworks": "*",
+  "platforms": "*"
+}

@@ -16,6 +16,7 @@
 #include "secrets.h"
 #include "vibe_hid.h"
 #include "vibe_power.h"
+#include "vibe_status.h"
 #include "voice.h"
 
 namespace {
@@ -70,6 +71,7 @@ constexpr int kTouchPair = kAgentCount + 6;
 constexpr int kTouchVolume = kAgentCount + 7;
 constexpr int kTouchVibrationStrength = kAgentCount + 8;
 constexpr int kTouchAgentStateVibe = kAgentCount + 9;
+constexpr int kTouchStatus = kAgentCount + 10;
 
 struct AgentState {
     std::uint32_t color = 0;
@@ -169,6 +171,18 @@ constexpr std::uint8_t kActiveBrightness = 80;
 constexpr std::uint8_t kDimBrightness = 18;
 vibe::PowerController g_power({VIBE_DIM_AFTER_S * 1000UL, VIBE_SLEEP_AFTER_S * 1000UL}, 0);
 vibe::PowerState g_appliedPower = vibe::PowerState::Active;
+
+// Hermes status (gauge ring + status page). Adapted from neilshare/vibewatch's
+// quota card (MIT): nothing is drawn as live data until the bridge sends it,
+// and old data is shown as STALE.
+vibe::HostStatus g_hostStatus;
+bool g_statusOpen = false;
+vibe::StatusFreshness g_lastStatusFreshness = vibe::StatusFreshness::Unavailable;
+std::uint32_t g_lastStatusSecond = 0;
+constexpr int kStatusRingOuter = 231;
+constexpr int kStatusRingInner = 223;
+constexpr float kGaugeStartDeg = 115.0f;   // 0 deg = 3 o'clock, clockwise
+constexpr float kGaugeSweepDeg = 310.0f;   // gap at the bottom for the status bar
 
 std::array<int, kAgentCount> agentX{};
 std::array<int, kAgentCount> agentY{};
@@ -486,6 +500,29 @@ void applyApprovalCancel(JsonVariantConst params) {
     }
 }
 
+void applyHostStatus(JsonVariantConst params) {
+    vibe::StatusInput in;
+    in.health = params["health"] | "";
+    in.runs = params["runs"] | 0;
+    in.jobs = params["jobs"] | 0;
+    in.tokensToday = params["tokens_today"] | 0.0;
+    in.budget = params["budget"] | 0.0;
+    in.remainingPercent = params["remaining_pct"] | 100.0;
+    in.resetInSeconds = params["reset_s"] | static_cast<std::int64_t>(0);
+    in.staleAfterSeconds = params["ttl_s"] | 90U;
+    JsonArrayConst slots = params["slot_tokens"].as<JsonArrayConst>();
+    int i = 0;
+    for (JsonVariantConst v : slots) {
+        if (i >= vibe::kStatusSlotCount) break;
+        in.slotTokens[i++] = v | 0.0;
+    }
+    if (!g_hostStatus.apply(in, millis())) {
+        Serial.println("host.status rejected (out of range)");
+        return;
+    }
+    g_uiDirty = true;
+}
+
 void processRpc(const char* json) {
     JsonDocument request;
     const DeserializationError error = deserializeJson(request, json);
@@ -507,6 +544,8 @@ void processRpc(const char* json) {
         applyAmbientStatus(params);
     } else if (std::strcmp(method, "host.focused_app") == 0) {
         applyFocusedApp(params);
+    } else if (std::strcmp(method, "host.status") == 0) {
+        applyHostStatus(params);
     } else if (std::strcmp(method, "approval.request") == 0) {
         applyApprovalRequest(params);
     } else if (std::strcmp(method, "approval.cancel") == 0) {
@@ -662,6 +701,9 @@ int hitTestSettings(int x, int y) {
 }
 
 int hitTestMain(int x, int y) {
+    if (!g_actionLayer && y >= 418 && x >= 143 && x <= 323) {
+        return kTouchStatus;  // the status pill at the bottom
+    }
     const int settingsDx = x - kSettingsX;
     const int settingsDy = y - kSettingsY;
     if (!g_actionLayer &&
@@ -803,6 +845,10 @@ void handleTouch() {
             sendMicEvent(true);
             playMicSe(true);
             vibrate(150, 35);
+        } else if (g_activeTouch == kTouchStatus) {
+            g_statusOpen = true;
+            playSe(700.0f);
+            vibrate(80, 20);
         } else if (g_activeTouch == kTouchSettings) {
             g_settingsOpen = true;
             g_pendingDeviceSlot = g_deviceSlot;
@@ -1480,6 +1526,7 @@ void approvalLoop(std::uint32_t now) {
             return;
         }
         g_settingsOpen = false;
+        g_statusOpen = false;
         g_actionLayer = false;
         selectAgent(request->slot);
         resetInputStateForModal();
@@ -1565,6 +1612,169 @@ void updatePower() {
     applyPowerState(g_power.update(now));
 }
 
+// -----------------------------------------------------------------------------
+// Hermes status: gauge ring on the agent layer, full page from the status pill
+// -----------------------------------------------------------------------------
+
+std::uint16_t healthColor(vibe::StatusFreshness freshness) {
+    if (freshness != vibe::StatusFreshness::Fresh) {
+        return M5.Display.color565(96, 102, 116);  // grey: no trustworthy data
+    }
+    switch (g_hostStatus.health) {
+        case vibe::HostHealth::Ok: return M5.Display.color565(66, 232, 139);
+        case vibe::HostHealth::Degraded: return M5.Display.color565(255, 172, 54);
+        case vibe::HostHealth::Offline: return M5.Display.color565(245, 90, 104);
+        default: return M5.Display.color565(96, 102, 116);
+    }
+}
+
+// Arc helper that copes with sweeps crossing 0 degrees.
+void fillGaugeArc(int outer, int inner, float fromDeg, float sweepDeg, std::uint16_t color) {
+    if (sweepDeg <= 0.5f) return;
+    const float end = fromDeg + sweepDeg;
+    if (end <= 360.0f) {
+        M5.Display.fillArc(kScreenCenter, kScreenCenter, outer, inner, fromDeg, end, color);
+    } else {
+        M5.Display.fillArc(kScreenCenter, kScreenCenter, outer, inner, fromDeg, 360.0f, color);
+        M5.Display.fillArc(kScreenCenter, kScreenCenter, outer, inner, 0.0f, end - 360.0f, color);
+    }
+}
+
+void drawGauge(int outer, int inner, std::uint32_t now) {
+    const auto freshness = g_hostStatus.freshness(now);
+    fillGaugeArc(outer, inner, kGaugeStartDeg, kGaugeSweepDeg, M5.Display.color565(34, 38, 48));
+    if (freshness == vibe::StatusFreshness::Unavailable) return;
+    const float fraction = g_hostStatus.hasBudget() ? g_hostStatus.remainingPercent / 100.0f : 1.0f;
+    fillGaugeArc(outer, inner, kGaugeStartDeg, kGaugeSweepDeg * fraction, healthColor(freshness));
+}
+
+void drawStatusRing(std::uint32_t now) {
+    drawGauge(kStatusRingOuter, kStatusRingInner, now);
+}
+
+void renderStatusPage(std::uint32_t now) {
+    const auto freshness = g_hostStatus.freshness(now);
+    const auto muted = M5.Display.color565(180, 188, 205);
+    const auto accent = healthColor(freshness);
+    drawGauge(226, 208, now);
+
+    M5.Display.setTextDatum(middle_center);
+    M5.Display.setFont(&fonts::Orbitron_Light_24);
+    M5.Display.setTextSize(0.8f);
+    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+    M5.Display.drawString("HERMES", kScreenCenter, 70);
+
+    if (freshness == vibe::StatusFreshness::Unavailable) {
+        M5.Display.setFont(&fonts::DejaVu18);
+        M5.Display.setTextSize(1.0f);
+        M5.Display.setTextColor(muted, TFT_BLACK);
+        M5.Display.drawString(g_connected ? "waiting for bridge..." : "not connected",
+                              kScreenCenter, kScreenCenter);
+        M5.Display.setTextSize(0.7f);
+        M5.Display.drawString("tap to close", kScreenCenter, 400);
+        return;
+    }
+
+    M5.Display.setTextSize(0.6f);
+    M5.Display.setTextColor(accent, TFT_BLACK);
+    M5.Display.drawString(freshness == vibe::StatusFreshness::Stale
+                              ? "STALE" : vibe::healthName(g_hostStatus.health),
+                          kScreenCenter, 104);
+
+    char big[16];
+    vibe::formatTokens(g_hostStatus.tokensToday, big, sizeof(big));
+    M5.Display.setFont(&fonts::Orbitron_Light_32);
+    M5.Display.setTextSize(1.3f);
+    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+    M5.Display.drawString(big, kScreenCenter, 160);
+
+    char line[48];
+    M5.Display.setFont(&fonts::DejaVu18);
+    M5.Display.setTextSize(0.85f);
+    M5.Display.setTextColor(muted, TFT_BLACK);
+    if (g_hostStatus.hasBudget()) {
+        char budget[16];
+        vibe::formatTokens(g_hostStatus.budget, budget, sizeof(budget));
+        std::snprintf(line, sizeof(line), "tokens today  %d%% of %s left",
+                      static_cast<int>(g_hostStatus.remainingPercent + 0.5f), budget);
+    } else {
+        std::snprintf(line, sizeof(line), "tokens today");
+    }
+    M5.Display.drawString(line, kScreenCenter, 204);
+
+    char reset[16];
+    vibe::formatDuration(g_hostStatus.resetRemainingSeconds(now), reset, sizeof(reset));
+    std::snprintf(line, sizeof(line), "resets in %s", reset);
+    M5.Display.drawString(line, kScreenCenter, 230);
+
+    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+    std::snprintf(line, sizeof(line), "runs %u    jobs %u",
+                  static_cast<unsigned>(g_hostStatus.runs), static_cast<unsigned>(g_hostStatus.jobs));
+    M5.Display.drawString(line, kScreenCenter, 266);
+
+    // Per-agent session tokens, two rows of three.
+    M5.Display.setTextSize(0.72f);
+    M5.Display.setTextColor(muted, TFT_BLACK);
+    for (int row = 0; row < 2; ++row) {
+        char rowText[64] = {};
+        for (int col = 0; col < 3; ++col) {
+            const int i = row * 3 + col;
+            char t[12];
+            if (g_hostStatus.slotTokens[i] == 0) {
+                std::snprintf(t, sizeof(t), "-");
+            } else {
+                vibe::formatTokens(g_hostStatus.slotTokens[i], t, sizeof(t));
+            }
+            char cell[20];
+            std::snprintf(cell, sizeof(cell), "%s%d:%s", col == 0 ? "" : "   ", i + 1, t);
+            std::strncat(rowText, cell, sizeof(rowText) - std::strlen(rowText) - 1);
+        }
+        M5.Display.drawString(rowText, kScreenCenter, 302 + row * 24);
+    }
+
+    char age[16];
+    vibe::formatDuration(g_hostStatus.ageSeconds(now), age, sizeof(age));
+    std::snprintf(line, sizeof(line), "%s %s ago",
+                  freshness == vibe::StatusFreshness::Stale ? "STALE, updated" : "updated", age);
+    M5.Display.setTextColor(freshness == vibe::StatusFreshness::Stale
+                                ? M5.Display.color565(255, 172, 54) : muted, TFT_BLACK);
+    M5.Display.drawString(line, kScreenCenter, 368);
+    M5.Display.setTextSize(0.7f);
+    M5.Display.setTextColor(muted, TFT_BLACK);
+    M5.Display.drawString("tap to close", kScreenCenter, 400);
+}
+
+// Consumes input while the status page is open; any tap or button closes it.
+bool handleStatusInput() {
+    if (!g_statusOpen) {
+        return false;
+    }
+    const auto touch = M5.Touch.getDetail();
+    if (touch.wasPressed() || M5.BtnA.wasPressed() || M5.BtnB.wasPressed()) {
+        g_statusOpen = false;
+        g_inputLockUntilRelease = true;
+        playSe(540.0f);
+        vibrate(60, 15);
+        g_uiDirty = true;
+    }
+    return true;
+}
+
+void statusLoop(std::uint32_t now) {
+    const auto freshness = g_hostStatus.freshness(now);
+    if (freshness != g_lastStatusFreshness) {
+        g_lastStatusFreshness = freshness;
+        g_uiDirty = true;  // ring turns grey the moment data goes stale
+    }
+    if (g_statusOpen) {
+        const std::uint32_t second = now / 1000;
+        if (second != g_lastStatusSecond) {
+            g_lastStatusSecond = second;
+            g_uiDirty = true;  // countdown and "updated Xs ago"
+        }
+    }
+}
+
 void renderUi(std::uint32_t now) {
     // Redraw the small round display as one frame. The UI is simple enough that
     // full-frame painting avoids stale pixels when switching between layers.
@@ -1573,6 +1783,14 @@ void renderUi(std::uint32_t now) {
 
     if (g_approvalShownAt != 0) {
         drawApprovalOverlay(now);
+        M5.Display.endWrite();
+        g_uiDirty = false;
+        g_lastUiDraw = now;
+        return;
+    }
+
+    if (g_statusOpen) {
+        renderStatusPage(now);
         M5.Display.endWrite();
         g_uiDirty = false;
         g_lastUiDraw = now;
@@ -1590,6 +1808,9 @@ void renderUi(std::uint32_t now) {
     M5.Display.setTextDatum(middle_center);
     M5.Display.setFont(&fonts::Orbitron_Light_32);
     M5.Display.setTextSize(1);
+    if (!g_actionLayer) {
+        drawStatusRing(now);
+    }
     const int outerCount = g_actionLayer ? kActionCount : kAgentCount;
     if (g_actionLayer) {
         drawPhysicalActionLinks();
@@ -1900,12 +2121,13 @@ void loop() {
     }
 
     updatePower();
-    if (!handleApprovalInput()) {
+    if (!handleApprovalInput() && !handleStatusInput()) {
         handleTouch();
         handlePhysicalButtons();
     }
     voice::loop();
     approvalLoop(millis());
+    statusLoop(millis());
     static int lastVoiceState = 0;
     const int voiceState = voice::isCapturing() ? 1 : (voice::isSpeaking() ? 2 : 0);
     if (voiceState != lastVoiceState) {

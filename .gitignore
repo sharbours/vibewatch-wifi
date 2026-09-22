@@ -10,3 +10,4 @@ bridge/.env
 bridge/.venv/
 bridge/models/
 __pycache__/
+bridge/usage.json
