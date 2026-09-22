@@ -74,6 +74,29 @@ Only runs started through the Runs API get interactive approvals. Hermes'
 `/v1/responses` and chat endpoints treat API clients as unattended and deny
 flagged commands outright, which is why the bridge now uses `/v1/runs`.
 
+## Power saving
+
+| State | When | Screen | CPU | Wi-Fi |
+| --- | --- | --- | --- | --- |
+| Active | any touch/button in the last 30 s | full brightness | 240 MHz | power save off (snappy push-to-talk) |
+| Dimmed | 30 s idle | dim | 160 MHz | power save off |
+| Asleep | 90 s idle | panel off | 80 MHz | modem sleep (radio wakes for AP beacons only) |
+
+- Any touch or button wakes it. The tap that wakes a **dark** screen is swallowed
+  (short buzz), so it can't fire an agent, OK/NG, or push-to-talk you couldn't see.
+  From **dimmed**, input works normally.
+- It stays awake while recording, while a reply is playing, while Settings is open,
+  and while an approval is pending. An approval arriving wakes a sleeping watch.
+- Agent-state buzzes still happen while asleep; only the screen stays off.
+- Tune the timeouts in `include/secrets.h` with `VIBE_DIM_AFTER_S` / `VIBE_SLEEP_AFTER_S`.
+- Replies arrive a little slower while asleep (modem sleep adds up to a few hundred ms).
+- The serial monitor logs `Power: active -> dimmed` etc., handy for checking behaviour.
+- If the screen ever stays black after waking, remove the `M5.Display.sleep()` and
+  `M5.Display.wakeup()` calls in `applyPowerState()`; brightness 0 alone still saves most of the display power.
+
+To measure the gain, charge fully, leave the watch idle for an hour with and
+without the patch, and compare the battery % on the status bar.
+
 ## 1. Hermes (inside the container)
 
 Add to `~/.hermes/.env` and restart `hermes gateway`:
@@ -125,18 +148,19 @@ The ESP32-S3 only does 2.4 GHz Wi-Fi — make sure your SSID has a 2.4 GHz band.
 - NG while busy calls Hermes' `/v1/runs/{id}/stop`; Hermes stops at its next safe point.
 - Each watch slot is a Hermes session named `vibewatch-<watch>-agentN-gG`, so you can
   find and continue them from the Hermes dashboard or CLI. The AI button starts a new one.
-- Wi-Fi uses more battery than BLE. Expect noticeably shorter runtime on the 450 mAh cell.
+- Wi-Fi uses more battery than BLE; power saving (above) claws much of it back when idle.
 - Traffic is plain `ws://` on your LAN, authenticated by the shared token.
   Don’t port-forward 8765 to the internet.
 
 ## Credits
 
-The approval state machine (`lib/vibe_approval`) and the pop-up layout are adapted
+The approval state machine (`lib/vibe_approval`), the pop-up layout, and the
+power-saving scheme (`lib/vibe_power`) are adapted
 from [neilshare/vibewatch](https://github.com/neilshare/vibewatch) (MIT), itself a
 fork of [GOROman/vibewatch](https://github.com/GOROman/vibewatch).
 
 ## Tests
 
 ```bash
-python3 -m platformio test -e native   # approval state machine, runs on your PC
+python3 -m platformio test -e native   # approval + power state machines, run on your PC
 ```

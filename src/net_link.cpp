@@ -130,6 +130,11 @@ bool sendText(const String& json) {
     return sendText(json.c_str(), json.length());
 }
 
+void setPowerSave(bool enabled) {
+    WiFi.setSleep(enabled);
+    Serial.printf("Wi-Fi power save %s\n", enabled ? "on" : "off");
+}
+
 bool sendBinary(const std::uint8_t* data, std::size_t length) {
     if (!s_connected) {
         return false;

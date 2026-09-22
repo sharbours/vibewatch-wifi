@@ -26,4 +26,8 @@ bool sendText(const char* json, std::size_t length);
 bool sendText(const String& json);
 bool sendBinary(const std::uint8_t* data, std::size_t length);
 
+// Wi-Fi modem sleep. Off while the screen is on (push-to-talk latency), on
+// while it is off (the radio then wakes only for AP beacons).
+void setPowerSave(bool enabled);
+
 }  // namespace net

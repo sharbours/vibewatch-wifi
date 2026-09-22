@@ -12,3 +12,7 @@
 
 // Shared secret. Must match WATCH_TOKEN in the bridge's .env file.
 #define VIBE_BRIDGE_TOKEN  "change-me-to-a-long-random-string"
+
+// Optional power-saving timeouts (seconds of no touch/button activity).
+// #define VIBE_DIM_AFTER_S   30   // dim screen, CPU 240 -> 160 MHz
+// #define VIBE_SLEEP_AFTER_S 90   // screen off, CPU 80 MHz, Wi-Fi modem sleep

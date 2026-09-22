@@ -1,0 +1,7 @@
+{
+  "name": "vibe_power",
+  "version": "1.0.0",
+  "description": "Inactivity-driven Active/Dimmed/Asleep state machine (hardware independent)",
+  "frameworks": "*",
+  "platforms": "*"
+}

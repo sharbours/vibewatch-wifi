@@ -13,7 +13,9 @@
 #include "net_link.h"
 #include "sound.h"
 #include "vibe_approval.h"
+#include "secrets.h"
 #include "vibe_hid.h"
+#include "vibe_power.h"
 #include "voice.h"
 
 namespace {
@@ -154,6 +156,19 @@ std::uint32_t g_approvalLastSecond = 0;
 bool g_inputLockUntilRelease = false;      // swallow the press that answered
 constexpr std::uint32_t kApprovalArmMs = 700;          // ignore presses right after pop-up
 constexpr std::uint32_t kApprovalReminderMs = 30000;
+
+// Power saving (idea from neilshare/vibewatch, MIT). Timeouts can be overridden
+// in include/secrets.h.
+#ifndef VIBE_DIM_AFTER_S
+#define VIBE_DIM_AFTER_S 30
+#endif
+#ifndef VIBE_SLEEP_AFTER_S
+#define VIBE_SLEEP_AFTER_S 90
+#endif
+constexpr std::uint8_t kActiveBrightness = 80;
+constexpr std::uint8_t kDimBrightness = 18;
+vibe::PowerController g_power({VIBE_DIM_AFTER_S * 1000UL, VIBE_SLEEP_AFTER_S * 1000UL}, 0);
+vibe::PowerState g_appliedPower = vibe::PowerState::Active;
 
 std::array<int, kAgentCount> agentX{};
 std::array<int, kAgentCount> agentY{};
@@ -1488,6 +1503,68 @@ void approvalLoop(std::uint32_t now) {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Power saving: Active (240 MHz, full brightness) -> Dimmed (160 MHz, dim) ->
+// Asleep (80 MHz, panel off, Wi-Fi modem sleep). 80 MHz is the lowest clock
+// the ESP32-S3 Wi-Fi driver supports.
+// -----------------------------------------------------------------------------
+
+void applyPowerState(vibe::PowerState next) {
+    if (next == g_appliedPower) {
+        return;
+    }
+    const bool wasAsleep = g_appliedPower == vibe::PowerState::Asleep;
+    switch (next) {
+        case vibe::PowerState::Active:
+            setCpuFrequencyMhz(240);
+            if (wasAsleep) {
+                M5.Display.wakeup();
+                net::setPowerSave(false);
+            }
+            M5.Display.setBrightness(kActiveBrightness);
+            break;
+        case vibe::PowerState::Dimmed:
+            setCpuFrequencyMhz(160);
+            if (wasAsleep) {
+                M5.Display.wakeup();
+                net::setPowerSave(false);
+            }
+            M5.Display.setBrightness(kDimBrightness);
+            break;
+        case vibe::PowerState::Asleep:
+            M5.Display.setBrightness(0);
+            M5.Display.sleep();
+            setCpuFrequencyMhz(80);
+            net::setPowerSave(true);
+            break;
+    }
+    Serial.printf("Power: %s -> %s\n", vibe::powerStateName(g_appliedPower),
+                  vibe::powerStateName(next));
+    g_appliedPower = next;
+    g_uiDirty = true;  // repaint whatever changed while the panel was off
+}
+
+void updatePower() {
+    const std::uint32_t now = millis();
+    const auto touch = M5.Touch.getDetail();
+    const bool userInput = touch.isPressed() || touch.wasPressed() || touch.wasReleased() ||
+                           M5.BtnA.isPressed() || M5.BtnB.isPressed() ||
+                           M5.BtnA.wasReleased() || M5.BtnB.wasReleased();
+    if (userInput && g_power.noteUserActivity(now)) {
+        // The tap/press that wakes a dark screen must not also trigger an
+        // agent, OK/NG, or push-to-talk the user couldn't see.
+        g_inputLockUntilRelease = true;
+        vibrate(60, 15);
+    }
+    // Keep the screen on while something needs it: recording, a spoken reply,
+    // or an approval (which also wakes a sleeping watch).
+    if (voice::isCapturing() || voice::isSpeaking() || g_approvals.pending() ||
+        g_settingsOpen || g_restartAt != 0) {
+        g_power.noteSystemActivity(now);
+    }
+    applyPowerState(g_power.update(now));
+}
+
 void renderUi(std::uint32_t now) {
     // Redraw the small round display as one frame. The UI is simple enough that
     // full-frame painting avoids stale pixels when switching between layers.
@@ -1779,7 +1856,7 @@ void setup() {
     config.internal_spk = true;
     config.internal_mic = true;
     M5.begin(config);
-    M5.Display.setBrightness(80);
+    M5.Display.setBrightness(kActiveBrightness);
     M5.Display.setRotation(0);
 
     loadPreferences();
@@ -1822,6 +1899,7 @@ void loop() {
         }
     }
 
+    updatePower();
     if (!handleApprovalInput()) {
         handleTouch();
         handlePhysicalButtons();
@@ -1861,9 +1939,11 @@ void loop() {
     }
     const std::uint32_t uiPeriod = g_selectionAnimating ? kSelectionAnimationPeriodMs
                                                         : kUiAnimationPeriodMs;
-    if ((g_uiDirty || uiIsAnimated()) && now - g_lastUiDraw >= uiPeriod) {
+    const bool screenOn = g_appliedPower != vibe::PowerState::Asleep;
+    if (screenOn && (g_uiDirty || uiIsAnimated()) && now - g_lastUiDraw >= uiPeriod) {
         renderUi(now);
     }
 
-    delay(5);
+    // Slower polling while the screen is off still catches a tap or press.
+    delay(screenOn ? 5 : 20);
 }
