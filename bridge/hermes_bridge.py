@@ -7,8 +7,10 @@ connects over Wi-Fi (WebSocket) and this service:
 
   * receives push-to-talk audio (16 kHz PCM16 mono) from the watch mic
   * transcribes it locally with faster-whisper
-  * sends the text to Hermes Agent's API server (/v1/responses), one named
-    conversation per agent slot (the six dots on the watch face)
+  * starts a Hermes Agent run (/v1/runs), one Hermes session per agent slot
+    (the six dots on the watch face), and follows its event stream
+  * forwards Hermes' dangerous-command approvals to the watch as a pop-up and
+    answers them with the button the user pressed (/v1/runs/{id}/approval)
   * speaks the reply with Piper TTS and streams PCM back to the watch
   * drives the six agent LEDs with the same v.oai.thstatus messages the
     original firmware already understands
@@ -25,6 +27,7 @@ import logging
 import os
 import re
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -73,8 +76,13 @@ PLAN_INSTRUCTIONS = (
     "PLAN MODE is on: describe what you intend to do and wait for approval "
     "before running tools that change anything."
 )
-APPROVE_TEXT = os.getenv("APPROVE_TEXT", "Yes, approved. Go ahead.")
+APPROVE_TEXT = os.getenv("APPROVE_TEXT", "Yes, go ahead.")
 REJECT_TEXT = os.getenv("REJECT_TEXT", "No, don't do that. Stop and wait for my next instruction.")
+
+# Must stay below Hermes' approvals.timeout (default 300 s) so the watch's
+# "expired" (= deny) arrives before Hermes gives up on its own.
+APPROVAL_TTL_S = int(os.getenv("APPROVAL_TTL_S", "240"))
+APPROVAL_SPEAK = os.getenv("APPROVAL_SPEAK", "1") not in ("0", "false", "no")
 
 AGENT_COUNT = 6
 MIC_RATE = 16000
@@ -90,6 +98,7 @@ STATE_STYLE = {
     "unheard": (0x42E88B, 1.0, 6, 0.4),
     "done": (0x42E88B, 0.7, 1, 0.0),
     "error": (0xF55367, 1.0, 1, 0.0),
+    "approval": (0xFFAC28, 1.0, 4, 0.9),
 }
 
 # Key names sent by the unchanged watch UI (see sendOuterActionEvent in main.cpp)
@@ -153,42 +162,74 @@ def spoken(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Hermes Agent client
+# Hermes Agent client (Runs API)
 # ---------------------------------------------------------------------------
+
+TERMINAL_EVENTS = {"run.completed", "run.failed", "run.cancelled", "run.interrupted"}
+TERMINAL_STATUSES = {"completed", "failed", "cancelled", "interrupted"}
+
+
+class HermesRunError(RuntimeError):
+    pass
 
 
 class Hermes:
     def __init__(self) -> None:
         self.http = httpx.AsyncClient(
             base_url=HERMES_URL,
-            timeout=httpx.Timeout(HERMES_TIMEOUT, connect=10.0),
+            timeout=httpx.Timeout(60.0, connect=10.0),
             headers={"Authorization": f"Bearer {HERMES_KEY}"},
         )
 
-    async def ask(self, text: str, conversation: str, session_key: str, plan: bool) -> str:
+    async def start_run(self, text: str, session_id: str, session_key: str, plan: bool) -> str:
         instructions = VOICE_INSTRUCTIONS + ("\n\n" + PLAN_INSTRUCTIONS if plan else "")
         resp = await self.http.post(
-            "/v1/responses",
+            "/v1/runs",
             headers={"X-Hermes-Session-Key": session_key},
             json={
                 "model": HERMES_MODEL,
                 "input": text,
                 "instructions": instructions,
-                "conversation": conversation,
-                "store": True,
+                "session_id": session_id,
             },
         )
         resp.raise_for_status()
-        data = resp.json()
-        if isinstance(data.get("output_text"), str) and data["output_text"].strip():
-            return data["output_text"]
-        parts: list[str] = []
-        for item in data.get("output", []):
-            if item.get("type") == "message":
-                for c in item.get("content", []):
-                    if c.get("type") in ("output_text", "text"):
-                        parts.append(c.get("text", ""))
-        return "\n".join(parts).strip() or "I finished, but had nothing to say."
+        return resp.json()["run_id"]
+
+    async def events(self, run_id: str):
+        """Yield decoded events from GET /v1/runs/{id}/events (SSE, data-only frames)."""
+        timeout = httpx.Timeout(HERMES_TIMEOUT, connect=10.0)
+        async with self.http.stream("GET", f"/v1/runs/{run_id}/events", timeout=timeout) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if line.startswith("data: "):
+                    try:
+                        yield json.loads(line[6:])
+                    except json.JSONDecodeError:
+                        continue
+
+    async def status(self, run_id: str) -> dict:
+        resp = await self.http.get(f"/v1/runs/{run_id}")
+        resp.raise_for_status()
+        return resp.json()
+
+    async def answer_approval(self, run_id: str, request_id: str, approve: bool) -> bool:
+        resp = await self.http.post(
+            f"/v1/runs/{run_id}/approval",
+            json={"choice": "once" if approve else "deny", "request_id": request_id},
+        )
+        if resp.status_code == 409:
+            # Already resolved elsewhere, withdrawn, or the run ended.
+            log.info("approval %s no longer pending: %s", request_id[:8], resp.text[:200])
+            return False
+        resp.raise_for_status()
+        return True
+
+    async def stop(self, run_id: str) -> None:
+        try:
+            await self.http.post(f"/v1/runs/{run_id}/stop")
+        except httpx.HTTPError as exc:
+            log.warning("stop %s failed: %s", run_id, exc)
 
     async def health(self) -> bool:
         try:
@@ -197,27 +238,63 @@ class Hermes:
         except httpx.HTTPError:
             return False
 
+    async def supports_approvals(self) -> bool:
+        try:
+            r = await self.http.get("/v1/capabilities")
+            feats = r.json().get("features", {})
+            return bool(feats.get("run_approval_response") or feats.get("run_approval")
+                        or feats.get("approval_events"))
+        except (httpx.HTTPError, ValueError):
+            return False
+
 
 # ---------------------------------------------------------------------------
-# Per-watch session
+# Approvals: one pop-up on the watch at a time, the rest queue here
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PendingApproval:
+    request_id: str
+    run_id: str
+    slot: int
+    title: str
+    detail: str
+    created: float = field(default_factory=time.monotonic)
+    future: asyncio.Future = field(default_factory=lambda: asyncio.get_running_loop().create_future())
+
+    def ttl_ms(self) -> int:
+        left = APPROVAL_TTL_S - (time.monotonic() - self.created)
+        return max(5000, int(left * 1000))
+
+
+def approval_texts(event: dict) -> tuple[str, str]:
+    title = (event.get("description") or "").strip() or "Run a flagged command"
+    detail = re.sub(r"\s+", " ", str(event.get("command") or "")).strip()
+    return title[:60], detail[:150]
+
+
+# ---------------------------------------------------------------------------
+# Per-watch state (survives Wi-Fi reconnects)
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class Slot:
     state: str = "idle"
-    generation: int = 0  # bumped by the AI button to start a fresh conversation
+    generation: int = 0  # bumped by the AI button to start a fresh session
     task: asyncio.Task | None = None
+    run_id: str | None = None
     last_reply: str = ""
     unheard: bool = False
 
 
 @dataclass
-class Watch:
-    ws: ServerConnection
+class Device:
     device: str
     speech: Speech
     hermes: Hermes
+    ws: ServerConnection | None = None
     slots: list[Slot] = field(default_factory=lambda: [Slot() for _ in range(AGENT_COUNT)])
     selected: int = 0
     plan_mode: bool = False
@@ -225,17 +302,40 @@ class Watch:
     rec_slot: int = 0
     rec_buf: bytearray = field(default_factory=bytearray)
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    approval_queue: deque = field(default_factory=deque)
+    approval_current: PendingApproval | None = None
 
     # -- outbound --------------------------------------------------------
 
     async def send_json(self, obj: dict) -> None:
-        async with self.send_lock:
-            await self.ws.send(json.dumps(obj, separators=(",", ":")))
+        if self.ws is None:
+            return
+        try:
+            async with self.send_lock:
+                await self.ws.send(json.dumps(obj, separators=(",", ":")))
+        except websockets.ConnectionClosed:
+            pass
+
+    async def send_audio(self, pcm: bytes, rate: int) -> bool:
+        if self.ws is None:
+            return False
+        try:
+            async with self.send_lock:
+                await self.ws.send(json.dumps({"m": "tts.begin", "p": {"rate": rate, "bytes": len(pcm)}}))
+                for off in range(0, len(pcm), 4096):
+                    await self.ws.send(pcm[off : off + 4096])
+                await self.ws.send(json.dumps({"m": "tts.end"}))
+            return True
+        except websockets.ConnectionClosed:
+            return False
 
     async def push_status(self) -> None:
         params = []
         for i, slot in enumerate(self.slots):
-            c, b, e, s = STATE_STYLE[slot.state]
+            state = slot.state
+            if self.approval_waiting_for(i):
+                state = "approval"
+            c, b, e, s = STATE_STYLE[state]
             params.append({"id": i, "c": c, "b": b, "e": e, "s": s})
         await self.send_json({"method": "v.oai.thstatus", "params": params})
 
@@ -244,82 +344,256 @@ class Watch:
         await self.push_status()
 
     async def show_label(self, text: str) -> None:
-        await self.send_json({"method": "host.focused_app", "params": {"appName": text}})
+        await self.send_json({"method": "host.focused_app", "params": {"appName": text[:18]}})
+
+    async def announce(self, text: str) -> None:
+        pcm, rate = await self.speech.synthesize(text)
+        if not self.recording:
+            await self.send_audio(pcm, rate)
 
     async def speak(self, idx: int, text: str) -> None:
         text = spoken(text)
         if not text:
             return
         pcm, rate = await self.speech.synthesize(text)
-        if self.recording:
-            # User started talking while we synthesized; keep it for later.
+        if self.recording or self.ws is None:
             self.slots[idx].unheard = True
             await self.set_state(idx, "unheard")
             return
         await self.set_state(idx, "speaking")
-        async with self.send_lock:
-            await self.ws.send(json.dumps({"m": "tts.begin", "p": {"rate": rate, "bytes": len(pcm)}}))
-            for off in range(0, len(pcm), 4096):
-                await self.ws.send(pcm[off : off + 4096])
-            await self.ws.send(json.dumps({"m": "tts.end"}))
+        if not await self.send_audio(pcm, rate):
+            self.slots[idx].unheard = True
+            await self.set_state(idx, "unheard")
+            return
         self.slots[idx].unheard = False
-        # Approximate playback time, then settle the LED.
-        await asyncio.sleep(len(pcm) / 2 / rate)
+        await asyncio.sleep(len(pcm) / 2 / rate)  # approximate playback time
         if self.slots[idx].state == "speaking":
             await self.set_state(idx, "done")
 
-    # -- agent turns -----------------------------------------------------
+    # -- connection lifecycle --------------------------------------------
 
-    def conversation_name(self, idx: int) -> str:
-        return f"{self.device}-agent{idx + 1}-g{self.slots[idx].generation}"
+    async def attach(self, ws: ServerConnection) -> None:
+        if self.ws is not None and self.ws is not ws:
+            await self.ws.close(code=4000, reason="replaced by new connection")
+        self.ws = ws
+        self.recording = False
+
+    async def detach(self, ws: ServerConnection) -> None:
+        if self.ws is ws:
+            self.ws = None
+            self.recording = False
+        # Runs and approvals keep going; the pop-up is re-sent on reconnect and
+        # the watch-side TTL still fails closed if nobody answers.
+
+    # -- approvals ---------------------------------------------------------
+
+    def approval_waiting_for(self, slot: int) -> bool:
+        if self.approval_current and self.approval_current.slot == slot:
+            return True
+        return any(p.slot == slot for p in self.approval_queue)
+
+    async def request_approval(self, slot: int, run_id: str, event: dict) -> bool:
+        """Queue an approval, show it on the watch, and wait for the answer."""
+        rid = str(event.get("request_id") or "")
+        if not rid:
+            log.warning("[%s] approval without request_id; denying", self.device)
+            return False
+        title, detail = approval_texts(event)
+        pa = PendingApproval(request_id=rid, run_id=run_id, slot=slot, title=title, detail=detail)
+        self.approval_queue.append(pa)
+        log.info("[%s] agent%d approval %s: %s | %s", self.device, slot + 1, rid[:8], title, detail)
+        await self.pump_approvals()
+        try:
+            choice = await asyncio.wait_for(asyncio.shield(pa.future), timeout=APPROVAL_TTL_S + 30)
+        except asyncio.TimeoutError:
+            choice = "expired"
+        finally:
+            await self.drop_approval(rid, notify_watch=True)
+        log.info("[%s] approval %s -> %s", self.device, rid[:8], choice)
+        return choice == "approve"
+
+    async def pump_approvals(self) -> None:
+        if self.approval_current is None and self.approval_queue:
+            self.approval_current = self.approval_queue.popleft()
+            await self.show_current_approval(announce=True)
+        await self.push_status()
+
+    async def show_current_approval(self, announce: bool) -> None:
+        pa = self.approval_current
+        if pa is None:
+            return
+        await self.send_json({"m": "approval.request", "p": {
+            "id": pa.request_id, "slot": pa.slot, "kind": "EXEC",
+            "title": pa.title, "detail": pa.detail, "ttl_ms": pa.ttl_ms(),
+        }})
+        if announce and APPROVAL_SPEAK:
+            asyncio.create_task(self.announce(f"Agent {pa.slot + 1} needs approval: {pa.title}."))
+
+    async def on_approval_decision(self, rid: str, choice: str) -> None:
+        pa = self.approval_current
+        if pa is None or pa.request_id != rid:
+            log.info("[%s] stale approval decision %s for %s", self.device, choice, rid[:8])
+            return
+        if choice == "busy":
+            # Watch still had another pop-up; re-send shortly.
+            await asyncio.sleep(1.0)
+            await self.show_current_approval(announce=False)
+            return
+        if choice == "invalid":
+            choice = "reject"
+        if not pa.future.done():
+            pa.future.set_result(choice)
+
+    async def drop_approval(self, rid: str, notify_watch: bool) -> None:
+        """Remove an approval (answered, withdrawn, or its run ended)."""
+        for pa in list(self.approval_queue):
+            if pa.request_id == rid:
+                self.approval_queue.remove(pa)
+                if not pa.future.done():
+                    pa.future.set_result("cancelled")
+        if self.approval_current and self.approval_current.request_id == rid:
+            pa = self.approval_current
+            self.approval_current = None
+            if not pa.future.done():
+                pa.future.set_result("cancelled")
+                if notify_watch:
+                    await self.send_json({"m": "approval.cancel", "p": {"id": rid}})
+        await self.pump_approvals()
+
+    async def decide_for_slot(self, slot: int, approve: bool) -> bool:
+        """OK/NG from the normal layer while that agent's approval is pending."""
+        pa = self.approval_current
+        if pa and pa.slot == slot and not pa.future.done():
+            await self.send_json({"m": "approval.cancel", "p": {"id": pa.request_id}})
+            pa.future.set_result("approve" if approve else "reject")
+            return True
+        return False
+
+    # -- agent turns -------------------------------------------------------
+
+    def session_id(self, idx: int) -> str:
+        return f"vibewatch-{self.device}-agent{idx + 1}-g{self.slots[idx].generation}"
+
+    def busy(self, idx: int) -> bool:
+        t = self.slots[idx].task
+        return t is not None and not t.done()
 
     def submit(self, idx: int, text: str) -> None:
-        slot = self.slots[idx]
-        if slot.task and not slot.task.done():
-            log.info("[%s] slot %d busy; queuing is not supported, ignoring: %s", self.device, idx, text)
+        if self.busy(idx):
+            log.info("[%s] agent%d busy; ignoring: %s", self.device, idx + 1, text)
+            asyncio.create_task(self.announce(f"Agent {idx + 1} is still working."))
             return
-        slot.task = asyncio.create_task(self._turn(idx, text))
+        self.slots[idx].task = asyncio.create_task(self._turn(idx, text))
 
     async def _turn(self, idx: int, text: str) -> None:
         slot = self.slots[idx]
         try:
             await self.set_state(idx, "thinking")
             log.info("[%s] agent%d <- %r", self.device, idx + 1, text)
-            reply = await self.hermes.ask(
-                text, self.conversation_name(idx), f"vibewatch:{self.device}", self.plan_mode
-            )
+            slot.run_id = await self.hermes.start_run(
+                text, self.session_id(idx), f"vibewatch:{self.device}", self.plan_mode)
+            reply = await self.follow_run(idx, slot.run_id)
+            if reply is None:
+                await self.set_state(idx, "idle")
+                return
             log.info("[%s] agent%d -> %r", self.device, idx + 1, reply[:200])
             slot.last_reply = reply
-            if idx == self.selected and not self.recording:
-                await self.speak(idx, reply)
+            if idx == self.selected and not self.recording and self.ws is not None:
+                # Speak outside this task so the slot accepts a new question
+                # (or barge-in) while the reply is still playing.
+                asyncio.create_task(self.speak(idx, reply))
             else:
                 slot.unheard = True
                 await self.set_state(idx, "unheard")
         except asyncio.CancelledError:
+            if slot.run_id:
+                await self.hermes.stop(slot.run_id)
             await self.set_state(idx, "idle")
             raise
         except Exception as exc:  # noqa: BLE001
             log.exception("[%s] agent%d failed", self.device, idx + 1)
             await self.set_state(idx, "error")
-            try:
-                await self.speak_error(idx, exc)
-            except Exception:  # noqa: BLE001
-                pass
+            await self.speak_error(exc)
+        finally:
+            slot.run_id = None
 
-    async def speak_error(self, idx: int, exc: Exception) -> None:
+    async def follow_run(self, idx: int, run_id: str) -> str | None:
+        """Consume the run's events until it ends. Returns the reply, or None if cancelled."""
+        approval_tasks: dict[str, asyncio.Task] = {}
+        terminal: dict | None = None
+
+        def handle_approval(event: dict) -> None:
+            rid = str(event.get("request_id") or "")
+            if rid and rid not in approval_tasks:
+                approval_tasks[rid] = asyncio.create_task(self._approval_flow(idx, run_id, event))
+
+        try:
+            try:
+                async for ev in self.hermes.events(run_id):
+                    name = ev.get("event", "")
+                    if name == "approval.request":
+                        handle_approval(ev)
+                    elif name == "approval.responded":
+                        # Answered from another client (CLI, Telegram, dashboard).
+                        rid = str(ev.get("request_id") or "")
+                        if rid:
+                            await self.drop_approval(rid, notify_watch=True)
+                    elif name == "tool.started" and ev.get("tool"):
+                        await self.show_label(str(ev["tool"]))
+                    elif name in TERMINAL_EVENTS:
+                        terminal = ev
+                        break
+            except httpx.HTTPError as exc:
+                log.warning("[%s] event stream for %s broke: %s; polling", self.device, run_id, exc)
+
+            # Stream ended without a terminal event: poll the run status instead.
+            while terminal is None:
+                st = await self.hermes.status(run_id)
+                status = st.get("status")
+                if status in TERMINAL_STATUSES:
+                    terminal = {"event": f"run.{status}", **st}
+                    break
+                if status == "waiting_for_approval" and isinstance(st.get("approval"), dict):
+                    handle_approval(st["approval"])
+                await asyncio.sleep(2.0)
+        finally:
+            for rid, task in approval_tasks.items():
+                if not task.done():
+                    task.cancel()
+                await self.drop_approval(rid, notify_watch=True)
+
+        name = terminal.get("event")
+        await self.show_label("Hermes")
+        if name == "run.completed":
+            return str(terminal.get("output") or "").strip() or "Done."
+        if name == "run.failed":
+            raise HermesRunError(str(terminal.get("error") or "run failed"))
+        return None  # cancelled / interrupted
+
+    async def _approval_flow(self, idx: int, run_id: str, event: dict) -> None:
+        rid = str(event["request_id"])
+        approve = await self.request_approval(idx, run_id, event)
+        try:
+            await self.hermes.answer_approval(run_id, rid, approve)
+        except httpx.HTTPError as exc:
+            log.warning("[%s] answering approval %s failed: %s", self.device, rid[:8], exc)
+        await self.set_state(idx, "thinking" if approve else self.slots[idx].state)
+
+    async def speak_error(self, exc: Exception) -> None:
         if isinstance(exc, httpx.ConnectError):
             msg = "I can't reach Hermes. Check that the gateway is running."
         elif isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 401:
             msg = "Hermes rejected the API key."
+        elif isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429:
+            msg = "Hermes is busy with too many runs. Try again shortly."
         else:
             msg = "Something went wrong talking to Hermes."
-        pcm, rate = await self.speech.synthesize(msg)
-        async with self.send_lock:
-            await self.ws.send(json.dumps({"m": "tts.begin", "p": {"rate": rate, "bytes": len(pcm)}}))
-            await self.ws.send(pcm)
-            await self.ws.send(json.dumps({"m": "tts.end"}))
+        try:
+            await self.announce(msg)
+        except Exception:  # noqa: BLE001
+            pass
 
-    # -- inbound ---------------------------------------------------------
+    # -- inbound -----------------------------------------------------------
 
     async def on_text(self, raw: str) -> None:
         try:
@@ -333,7 +607,11 @@ class Watch:
             log.info("[%s] hello %s", self.device, p)
             await self.push_status()
             ok = await self.hermes.health()
+            if ok and not await self.hermes.supports_approvals():
+                log.warning("This Hermes build does not advertise run approvals; update Hermes.")
             await self.show_label("Hermes" if ok else "Hermes offline")
+            # Re-show an approval that was open when Wi-Fi dropped.
+            await self.show_current_approval(announce=False)
         elif m == "voice.start":
             self.recording = True
             self.rec_slot = int(p.get("slot", self.selected))
@@ -347,6 +625,8 @@ class Watch:
             idx, pcm = self.rec_slot, bytes(self.rec_buf)
             self.rec_buf.clear()
             asyncio.create_task(self.finish_recording(idx, pcm))
+        elif m == "approval.decision":
+            await self.on_approval_decision(str(p.get("id", "")), str(p.get("choice", "")))
         elif m == "v.oai.hid":
             await self.on_key(str(p.get("k", "")), bool(p.get("act")), int(p.get("slot", self.selected)))
         elif m == "device.battery":
@@ -376,14 +656,16 @@ class Watch:
             return
         self.selected = slot
         s = self.slots[slot]
-        busy = s.task is not None and not s.task.done()
         if key == KEY_OK:
-            self.submit(slot, APPROVE_TEXT)
+            if not await self.decide_for_slot(slot, approve=True) and not self.busy(slot):
+                self.submit(slot, APPROVE_TEXT)
         elif key == KEY_NG:
-            if busy:
-                # Stops waiting on this turn. Hermes may finish its current
-                # step in the background; see README for the Runs API upgrade.
-                s.task.cancel()
+            if await self.decide_for_slot(slot, approve=False):
+                return
+            if self.busy(slot):
+                # Real cancel: Hermes stops the run at the next safe point.
+                if s.run_id:
+                    await self.hermes.stop(s.run_id)
                 await self.send_json({"m": "tts.stop"})
             else:
                 self.submit(slot, REJECT_TEXT)
@@ -394,7 +676,7 @@ class Watch:
             self.plan_mode = not self.plan_mode
             await self.show_label("Plan mode" if self.plan_mode else "Hermes")
         elif key == KEY_AI:
-            if busy:
+            if self.busy(slot) and s.task:
                 s.task.cancel()
             s.generation += 1
             s.last_reply = ""
@@ -421,6 +703,10 @@ async def main() -> None:
     hermes = Hermes()
     if not await hermes.health():
         log.warning("Hermes API not reachable at %s yet (will keep trying per request)", HERMES_URL)
+    elif not await hermes.supports_approvals():
+        log.warning("Hermes at %s does not advertise run approvals; pop-ups won't appear", HERMES_URL)
+
+    devices: dict[str, Device] = {}
 
     async def handler(ws: ServerConnection) -> None:
         headers = ws.request.headers
@@ -428,22 +714,23 @@ async def main() -> None:
             log.warning("Rejected connection from %s", ws.remote_address)
             await ws.close(code=4401, reason="unauthorized")
             return
-        device = re.sub(r"[^a-zA-Z0-9_-]", "", headers.get("X-Vibe-Device", "vibe-watch")) or "vibe-watch"
-        watch = Watch(ws=ws, device=device, speech=speech, hermes=hermes)
-        log.info("Watch %s connected from %s", device, ws.remote_address)
+        name = re.sub(r"[^a-zA-Z0-9_-]", "", headers.get("X-Vibe-Device", "vibe-watch")) or "vibe-watch"
+        device = devices.get(name)
+        if device is None:
+            device = devices[name] = Device(device=name, speech=speech, hermes=hermes)
+        await device.attach(ws)
+        log.info("Watch %s connected from %s", name, ws.remote_address)
         try:
             async for frame in ws:
                 if isinstance(frame, bytes):
-                    await watch.on_audio(frame)
+                    await device.on_audio(frame)
                 else:
-                    await watch.on_text(frame)
+                    await device.on_text(frame)
         except websockets.ConnectionClosed:
             pass
         finally:
-            for s in watch.slots:
-                if s.task and not s.task.done():
-                    s.task.cancel()
-            log.info("Watch %s disconnected", device)
+            await device.detach(ws)
+            log.info("Watch %s disconnected", name)
 
     async with serve(handler, LISTEN_HOST, LISTEN_PORT, max_size=2**20, ping_interval=20):
         log.info("Bridge listening on ws://%s:%d/watch -> Hermes %s", LISTEN_HOST, LISTEN_PORT, HERMES_URL)

@@ -12,6 +12,7 @@
 
 #include "net_link.h"
 #include "sound.h"
+#include "vibe_approval.h"
 #include "vibe_hid.h"
 #include "voice.h"
 
@@ -144,6 +145,16 @@ std::uint8_t g_vibrationStrength = 255;
 bool g_agentStateVibeEnabled = true;
 std::uint32_t g_lastAgentVibrationAt = 0;
 
+// Approval pop-up. The controller owns the transaction (id, TTL, one pending
+// request at a time); these flags only track what is on screen.
+vibe::ApprovalController g_approvals;
+std::uint32_t g_approvalShownAt = 0;       // 0 = not on screen yet
+std::uint32_t g_approvalLastReminder = 0;
+std::uint32_t g_approvalLastSecond = 0;
+bool g_inputLockUntilRelease = false;      // swallow the press that answered
+constexpr std::uint32_t kApprovalArmMs = 700;          // ignore presses right after pop-up
+constexpr std::uint32_t kApprovalReminderMs = 30000;
+
 std::array<int, kAgentCount> agentX{};
 std::array<int, kAgentCount> agentY{};
 std::array<int, kActionCount> actionX{};
@@ -228,7 +239,7 @@ float effectBrightness(int effect, float brightness, float speed, std::uint32_t 
 }
 
 bool uiIsAnimated() {
-    if (g_selectionAnimating) {
+    if (g_selectionAnimating || g_approvalShownAt != 0) {
         return true;
     }
     for (const auto& state : g_agents) {
@@ -403,6 +414,63 @@ void sendRpcResponse(const char* method, int id) {
     Serial.printf("RPC response: %s id=%d\n", method, id);
 }
 
+// -----------------------------------------------------------------------------
+// Approval transport
+// -----------------------------------------------------------------------------
+
+void sendApprovalDecision(const vibe::ApprovalDecision& decision) {
+    char json[160];
+    const int n = std::snprintf(json, sizeof(json),
+        "{\"m\":\"approval.decision\",\"p\":{\"id\":\"%s\",\"choice\":\"%s\"}}",
+        decision.id, vibe::approvalChoiceName(decision.choice));
+    if (n > 0 && n < static_cast<int>(sizeof(json))) {
+        net::sendText(json, n);
+    }
+    Serial.printf("Approval %.8s -> %s\n", decision.id, vibe::approvalChoiceName(decision.choice));
+}
+
+void hideApproval() {
+    g_approvalShownAt = 0;
+    g_uiDirty = true;
+}
+
+void applyApprovalRequest(JsonVariantConst params) {
+    vibe::ApprovalRequest request;
+    vibe::copyUtf8(request.id, sizeof(request.id), params["id"] | "");
+    vibe::copyUtf8(request.kind, sizeof(request.kind), params["kind"] | "EXEC");
+    vibe::copyUtf8(request.title, sizeof(request.title), params["title"] | "");
+    vibe::copyUtf8(request.detail, sizeof(request.detail), params["detail"] | "");
+    const int slot = params["slot"] | 0;
+    request.slot = static_cast<std::uint8_t>(slot >= 0 && slot < kAgentCount ? slot : 0);
+    request.ttlMs = params["ttl_ms"] | 60000U;
+
+    const auto result = g_approvals.accept(request, millis());
+    if (result == vibe::ApprovalAcceptResult::Busy ||
+        result == vibe::ApprovalAcceptResult::Invalid) {
+        // Tell the bridge immediately; it keeps its own queue and retries.
+        char json[160];
+        const int n = std::snprintf(json, sizeof(json),
+            "{\"m\":\"approval.decision\",\"p\":{\"id\":\"%s\",\"choice\":\"%s\"}}",
+            request.id, result == vibe::ApprovalAcceptResult::Busy ? "busy" : "invalid");
+        if (n > 0 && n < static_cast<int>(sizeof(json))) {
+            net::sendText(json, n);
+        }
+        return;
+    }
+    if (result == vibe::ApprovalAcceptResult::Accepted) {
+        Serial.printf("Approval request %.8s slot=%d: %s\n", request.id, request.slot + 1,
+                      request.title);
+    }
+    g_uiDirty = true;  // shown by approvalLoop() once push-to-talk is idle
+}
+
+void applyApprovalCancel(JsonVariantConst params) {
+    if (g_approvals.withdraw(params["id"] | "")) {
+        hideApproval();
+        Serial.println("Approval withdrawn by host");
+    }
+}
+
 void processRpc(const char* json) {
     JsonDocument request;
     const DeserializationError error = deserializeJson(request, json);
@@ -424,6 +492,10 @@ void processRpc(const char* json) {
         applyAmbientStatus(params);
     } else if (std::strcmp(method, "host.focused_app") == 0) {
         applyFocusedApp(params);
+    } else if (std::strcmp(method, "approval.request") == 0) {
+        applyApprovalRequest(params);
+    } else if (std::strcmp(method, "approval.cancel") == 0) {
+        applyApprovalCancel(params);
     }
 
     if (id >= 0 && method[0] != '\0') {
@@ -1216,11 +1288,219 @@ void renderSettingsUi() {
     drawStatusBar();
 }
 
+// -----------------------------------------------------------------------------
+// Approval pop-up: layout adapted from neilshare/vibewatch drawApprovalOverlay()
+// (MIT), reworked as a full-screen card for the round display.
+// -----------------------------------------------------------------------------
+
+constexpr int kApprovalButtonY = 326;
+constexpr int kApprovalButtonH = 54;
+constexpr int kApprovalButtonW = 150;
+constexpr int kApprovalNgX = 70;
+constexpr int kApprovalOkX = 246;
+
+// Draws up to maxLines of wrapped text centred on the screen; returns lines used.
+int drawWrapped(const char* text, int y, int lineHeight, std::size_t maxBytes, int maxLines) {
+    char line[64];
+    int lines = 0;
+    while (text != nullptr && *text != '\0' && lines < maxLines) {
+        while (*text == ' ') {
+            ++text;
+        }
+        std::size_t n = vibe::utf8WrapIndex(text, std::min(maxBytes, sizeof(line) - 1));
+        if (n == 0) {
+            break;
+        }
+        const bool last = lines == maxLines - 1 && text[n] != '\0';
+        std::memcpy(line, text, n);
+        line[n] = '\0';
+        if (last && n >= 3) {
+            std::strcpy(line + vibe::utf8WrapIndex(line, n - 3), "...");
+        }
+        M5.Display.drawString(line, kScreenCenter, y + lines * lineHeight);
+        text += n;
+        ++lines;
+    }
+    return lines;
+}
+
+void drawApprovalOverlay(std::uint32_t now) {
+    const vibe::ApprovalRequest* request = g_approvals.current();
+    if (request == nullptr) {
+        return;
+    }
+    const auto amber = M5.Display.color565(255, 172, 54);
+    const auto greenOk = M5.Display.color565(43, 201, 110);
+    const auto redNg = M5.Display.color565(245, 90, 104);
+    const auto muted = M5.Display.color565(180, 188, 205);
+    const bool armed = now - g_approvalShownAt >= kApprovalArmMs;
+
+    // Pulsing amber bezel so the state is readable at a glance.
+    const float pulse = 0.55f + 0.45f * std::sin(static_cast<float>(now % 1400) / 1400.0f * 2.0f * PI);
+    drawThickCircle(kScreenCenter, kScreenCenter, 228, 6, scaledColor(0xFFAC28, pulse));
+
+    M5.Display.setTextDatum(middle_center);
+    M5.Display.setFont(&fonts::Orbitron_Light_24);
+    M5.Display.setTextSize(0.8f);
+    M5.Display.setTextColor(amber, TFT_BLACK);
+    M5.Display.drawString("APPROVAL", kScreenCenter, 66);
+
+    char header[40];
+    std::snprintf(header, sizeof(header), "AGENT %d  [ %s ]", request->slot + 1, request->kind);
+    M5.Display.setTextSize(0.55f);
+    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+    M5.Display.drawString(header, kScreenCenter, 104);
+
+    M5.Display.setFont(&fonts::DejaVu18);
+    M5.Display.setTextSize(1.0f);
+    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+    const int titleLines = drawWrapped(
+        request->title[0] != '\0' ? request->title : "Run this command?", 146, 24, 24, 2);
+
+    M5.Display.setTextSize(0.82f);
+    M5.Display.setTextColor(muted, TFT_BLACK);
+    drawWrapped(request->detail, 146 + titleLines * 24 + 14, 21, 28, 4 - titleLines + 1);
+
+    char countdown[16];
+    std::snprintf(countdown, sizeof(countdown), "%lus",
+                  static_cast<unsigned long>((g_approvals.remainingMs(now) + 999) / 1000));
+    M5.Display.setTextColor(amber, TFT_BLACK);
+    M5.Display.drawString(countdown, kScreenCenter, 300);
+
+    const auto drawButton = [&](int x, std::uint16_t fill, const char* label) {
+        const auto face = armed ? fill : scaledColor(0x3A3F4C, 1.0f);
+        M5.Display.fillRoundRect(x, kApprovalButtonY, kApprovalButtonW, kApprovalButtonH, 16, face);
+        drawThickRoundRect(x, kApprovalButtonY, kApprovalButtonW, kApprovalButtonH, 16, 2, TFT_WHITE);
+        M5.Display.setFont(&fonts::Orbitron_Light_24);
+        M5.Display.setTextSize(0.62f);
+        M5.Display.setTextColor(TFT_WHITE, face);
+        M5.Display.drawString(label, x + kApprovalButtonW / 2, kApprovalButtonY + kApprovalButtonH / 2);
+    };
+    // Left physical button (orange) = NG, right (blue) = OK, as elsewhere.
+    drawButton(kApprovalNgX, redNg, "NG");
+    drawButton(kApprovalOkX, greenOk, "OK");
+
+    M5.Display.setFont(&fonts::DejaVu18);
+    M5.Display.setTextSize(0.7f);
+    M5.Display.setTextColor(muted, TFT_BLACK);
+    M5.Display.drawString("L button          R button", kScreenCenter, 400);
+}
+
+void resetInputStateForModal() {
+    // Anything half-pressed when the pop-up appeared must not complete later
+    // as an agent/OK/NG action on the normal layer.
+    g_activeTouch = -1;
+    g_leftAgentPressed = -1;
+    g_leftPressPending = false;
+    g_rightActionPending = false;
+    g_rightActionPressed = false;
+    g_rightPhysicalPressedAt = 0;
+    g_buttonChordActive = false;
+    g_inputLockUntilRelease = true;
+}
+
+void answerApproval(vibe::ApprovalChoice choice) {
+    const auto decision = g_approvals.decide(choice, millis());
+    if (!decision.hasValue) {
+        return;
+    }
+    sendApprovalDecision(decision.value);
+    if (choice == vibe::ApprovalChoice::Approve) {
+        playOuterActionPressSe(kOkAction);
+        vibrate(180, 50);
+    } else {
+        playOuterActionPressSe(kNgAction);
+        vibrate(120, 35);
+    }
+    g_inputLockUntilRelease = true;
+    hideApproval();
+}
+
+// Returns true when the approval pop-up (or its release lock) owns input this
+// frame, so the normal touch/button handlers must not run.
+bool handleApprovalInput() {
+    const auto touch = M5.Touch.getDetail();
+    if (g_inputLockUntilRelease) {
+        if (!M5.BtnA.isPressed() && !M5.BtnB.isPressed() && !touch.isPressed()) {
+            g_inputLockUntilRelease = false;
+        }
+        return true;
+    }
+    if (g_approvalShownAt == 0) {
+        return false;
+    }
+    if (millis() - g_approvalShownAt < kApprovalArmMs) {
+        return true;  // arming delay: a stray press can't approve
+    }
+    if (M5.BtnA.wasPressed()) {
+        answerApproval(vibe::ApprovalChoice::Reject);
+    } else if (M5.BtnB.wasPressed()) {
+        answerApproval(vibe::ApprovalChoice::Approve);
+    } else if (touch.wasPressed() && touch.y >= kApprovalButtonY - 12 &&
+               touch.y <= kApprovalButtonY + kApprovalButtonH + 12) {
+        if (touch.x >= kApprovalNgX && touch.x < kApprovalNgX + kApprovalButtonW) {
+            answerApproval(vibe::ApprovalChoice::Reject);
+        } else if (touch.x >= kApprovalOkX && touch.x < kApprovalOkX + kApprovalButtonW) {
+            answerApproval(vibe::ApprovalChoice::Approve);
+        }
+    }
+    return true;
+}
+
+void approvalLoop(std::uint32_t now) {
+    const auto expired = g_approvals.expireIfNeeded(now);
+    if (expired.hasValue) {
+        sendApprovalDecision(expired.value);  // silence is not consent
+        playOuterActionPressSe(kNgAction);
+        hideApproval();
+        return;
+    }
+    const vibe::ApprovalRequest* request = g_approvals.current();
+    if (request == nullptr) {
+        return;
+    }
+    if (g_approvalShownAt == 0) {
+        // Never interrupt someone mid-sentence; show once push-to-talk ends.
+        if (voice::isCapturing()) {
+            return;
+        }
+        g_settingsOpen = false;
+        g_actionLayer = false;
+        selectAgent(request->slot);
+        resetInputStateForModal();
+        g_inputLockUntilRelease = M5.BtnA.isPressed() || M5.BtnB.isPressed() ||
+                                  M5.Touch.getDetail().isPressed();
+        g_approvalShownAt = now == 0 ? 1 : now;
+        g_approvalLastReminder = now;
+        vibrate(250, 90);
+        playSe(1250.0f, 75);
+        g_uiDirty = true;
+        return;
+    }
+    if (now - g_approvalLastReminder >= kApprovalReminderMs) {
+        g_approvalLastReminder = now;
+        vibrate(200, 60);
+    }
+    const std::uint32_t second = g_approvals.remainingMs(now) / 1000;
+    if (second != g_approvalLastSecond) {
+        g_approvalLastSecond = second;
+        g_uiDirty = true;
+    }
+}
+
 void renderUi(std::uint32_t now) {
     // Redraw the small round display as one frame. The UI is simple enough that
     // full-frame painting avoids stale pixels when switching between layers.
     M5.Display.startWrite();
     M5.Display.fillScreen(TFT_BLACK);
+
+    if (g_approvalShownAt != 0) {
+        drawApprovalOverlay(now);
+        M5.Display.endWrite();
+        g_uiDirty = false;
+        g_lastUiDraw = now;
+        return;
+    }
 
     if (g_settingsOpen) {
         renderSettingsUi();
@@ -1536,12 +1816,18 @@ void loop() {
             g_pairingSuccessPending = true;
         } else {
             g_activeTouch = -1;
+            // The bridge keeps the request and re-sends it on reconnect.
+            g_approvals.cancel(millis());
+            hideApproval();
         }
     }
 
-    handleTouch();
-    handlePhysicalButtons();
+    if (!handleApprovalInput()) {
+        handleTouch();
+        handlePhysicalButtons();
+    }
     voice::loop();
+    approvalLoop(millis());
     static int lastVoiceState = 0;
     const int voiceState = voice::isCapturing() ? 1 : (voice::isSpeaking() ? 2 : 0);
     if (voiceState != lastVoiceState) {

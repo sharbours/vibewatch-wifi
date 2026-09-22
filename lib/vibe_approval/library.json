@@ -1,0 +1,7 @@
+{
+  "name": "vibe_approval",
+  "version": "1.0.0",
+  "description": "Transactional approval state machine (hardware independent, unit-testable on the host)",
+  "frameworks": "*",
+  "platforms": "*"
+}
