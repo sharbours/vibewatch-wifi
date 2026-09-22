@@ -4,3 +4,9 @@
 .vscode/launch.json
 .vscode/ipch/
 compile_commands.json
+
+include/secrets.h
+bridge/.env
+bridge/.venv/
+bridge/models/
+__pycache__/

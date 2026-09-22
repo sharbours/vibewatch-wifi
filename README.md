@@ -1,5 +1,7 @@
 # Vibe Watch
 
+> **This fork:** Wi-Fi + voice chat with a self-hosted Hermes Agent instead of BLE + macOS. See [docs/HERMES_WIFI_SETUP.md](docs/HERMES_WIFI_SETUP.md).
+
 **English** | [日本語](README.ja.md) | [简体中文](README.zh-CN.md)
 
 [![Firmware build](https://github.com/GOROman/vibewatch/actions/workflows/firmware.yml/badge.svg)](https://github.com/GOROman/vibewatch/actions/workflows/firmware.yml)

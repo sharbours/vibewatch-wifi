@@ -1,8 +1,6 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <M5Unified.h>
-#include <NimBLEDevice.h>
-#include <NimBLEHIDDevice.h>
 #include <Preferences.h>
 
 #include <algorithm>
@@ -12,8 +10,10 @@
 #include <cstring>
 #include <string>
 
-#include "vibe_hid.h"
+#include "net_link.h"
 #include "sound.h"
+#include "vibe_hid.h"
+#include "voice.h"
 
 namespace {
 
@@ -92,19 +92,13 @@ std::array<AgentState, kAgentCount> g_agents;
 AmbientState g_ambient;
 String g_focusedApp;
 
-// BLE objects are created once during setup and remain valid for the lifetime
-// of the firmware. RPC messages are moved out of the BLE callback through a
-// FreeRTOS queue so JSON processing never blocks the NimBLE task.
-NimBLEServer* g_server = nullptr;
-NimBLEHIDDevice* g_hid = nullptr;
-NimBLECharacteristic* g_vendorInput = nullptr;
-NimBLECharacteristic* g_vendorOutput = nullptr;
+// RPC messages arrive from the Wi-Fi/WebSocket link (net_link.cpp) through a
+// FreeRTOS queue, exactly as they did from the original BLE callback.
 QueueHandle_t g_rpcQueue = nullptr;
 
 volatile bool g_connected = false;
 volatile bool g_uiDirty = true;
 volatile bool g_pairingSuccessPending = false;
-String g_rxBuffer;
 
 // Input state is intentionally explicit because a physical-button press may
 // become a single action, a long press, or a two-button layer-switch chord.
@@ -261,8 +255,12 @@ void updateBattery(bool notify) {
         g_batteryLevel = static_cast<std::uint8_t>(level);
     }
     g_isCharging = M5.Power.isCharging() == m5::Power_Class::is_charging;
-    if (g_hid != nullptr) {
-        g_hid->setBatteryLevel(g_batteryLevel, notify && g_connected);
+    if (notify && g_connected) {
+        char battery[80];
+        const int n = std::snprintf(battery, sizeof(battery),
+            "{\"m\":\"device.battery\",\"p\":{\"level\":%u,\"charging\":%s}}",
+            g_batteryLevel, g_isCharging ? "true" : "false");
+        net::sendText(battery, n);
     }
     g_lastBatteryUpdate = millis();
     g_uiDirty = true;
@@ -272,59 +270,32 @@ void updateBattery(bool notify) {
 // Host communication
 // -----------------------------------------------------------------------------
 
-// Vendor JSON-RPC messages are split into fixed-size HID reports. Byte 0 is the
-// channel, byte 1 is the payload length, and bytes 2..62 contain UTF-8 JSON.
-void sendFramedJson(String payload, bool appendCrlf) {
-    if (!g_connected || g_vendorInput == nullptr) {
+// JSON messages go out as WebSocket text frames. No 61-byte chunking is
+// needed any more; the payload format is unchanged from the BLE version.
+void sendFramedJson(String payload, bool /*appendCrlf*/) {
+    if (!g_connected) {
         return;
     }
-    if (appendCrlf && !payload.endsWith("\r\n")) {
-        payload += "\r\n";
-    }
-
-    const std::size_t total = payload.length();
-    std::size_t offset = 0;
-    while (offset < total) {
-        const std::size_t chunk = std::min(vibe::kRpcChunkLength, total - offset);
-        std::uint8_t report[vibe::kBleReportLength] = {};
-        report[0] = vibe::kChannelJsonRpc;
-        report[1] = static_cast<std::uint8_t>(chunk);
-        std::memcpy(&report[2], payload.c_str() + offset, chunk);
-        g_vendorInput->setValue(report, sizeof(report));
-        if (!g_vendorInput->notify()) {
-            Serial.println("BLE notify failed");
-            return;
-        }
-        offset += chunk;
-        if (offset < total) {
-            delay(8);
-        }
-    }
+    net::sendText(payload);
 }
 
 void sendKeyEvent(const char* key, bool pressed) {
-    if (!g_connected || g_vendorInput == nullptr) {
+    if (!g_connected) {
         return;
     }
-
-    // Match the working M5Core2 implementation byte-for-byte: one complete
-    // 63-byte vendor report with CRLF included in the payload length.
-    std::uint8_t report[vibe::kBleReportLength] = {};
-    report[0] = vibe::kChannelJsonRpc;
+    // Same {"m":"v.oai.hid"} event the Codex host expected, plus the currently
+    // selected agent so the bridge knows which Hermes session it applies to.
+    char payload[96];
     const int written = std::snprintf(
-        reinterpret_cast<char*>(&report[2]), vibe::kRpcChunkLength,
-        "{\"m\":\"v.oai.hid\",\"p\":{\"k\":\"%s\",\"act\":%u}}\r\n", key, pressed ? 1U : 0U);
-    if (written < 0 || written >= static_cast<int>(vibe::kRpcChunkLength)) {
+        payload, sizeof(payload),
+        "{\"m\":\"v.oai.hid\",\"p\":{\"k\":\"%s\",\"act\":%u,\"slot\":%d}}", key,
+        pressed ? 1U : 0U, g_selectedAgent);
+    if (written < 0 || written >= static_cast<int>(sizeof(payload))) {
         Serial.println("HID event payload overflow");
         return;
     }
-    report[1] = static_cast<std::uint8_t>(written);
-    g_vendorInput->setValue(report, sizeof(report));
-    if (!g_vendorInput->notify()) {
-        Serial.printf("HID notify failed: %s\n", key);
-        return;
-    }
-    Serial.printf("HID %s %s len=%d\n", key, pressed ? "DOWN" : "UP", written);
+    net::sendText(payload, written);
+    Serial.printf("KEY %s %s\n", key, pressed ? "DOWN" : "UP");
 }
 
 void sendAgentEvent(int index, bool pressed) {
@@ -340,11 +311,14 @@ void sendActionEvent(int index, bool pressed) {
 }
 
 void sendMicEvent(bool pressed) {
-    sendActionEvent(10, pressed);
-    // NimBLE notifications are asynchronous. Pace the paired MIC reports so
-    // ACT11 cannot overwrite ACT10 in the controller buffer before delivery.
-    delay(12);
-    sendActionEvent(11, pressed);
+    // The original firmware only sent ACT10/ACT11 and let the Mac do the
+    // dictation. Here the watch records its own microphone and streams PCM
+    // to the bridge, which runs speech-to-text before calling Hermes.
+    if (pressed) {
+        voice::pressToTalk(g_selectedAgent);
+    } else {
+        voice::releaseToTalk();
+    }
 }
 
 // Apply the host's compact agent-state array directly to the six ring buttons.
@@ -457,172 +431,26 @@ void processRpc(const char* json) {
     }
 }
 
-// BLE output callbacks run on NimBLE's task. This class only validates and
-// reassembles frames, then queues a complete JSON message for the main loop.
-class RpcOutputCallbacks : public NimBLECharacteristicCallbacks {
-    void onWrite(NimBLECharacteristic* characteristic, NimBLEConnInfo&) override {
-        const NimBLEAttValue value = characteristic->getValue();
-        const auto* data = value.data();
-        const std::size_t length = value.size();
-        if (data == nullptr || length < 2 || data[0] != vibe::kChannelJsonRpc) {
-            return;
-        }
-
-        const std::size_t chunkLength = data[1];
-        if (chunkLength > vibe::kRpcChunkLength || chunkLength > length - 2) {
-            Serial.println("Invalid RPC chunk");
-            g_rxBuffer = "";
-            return;
-        }
-        if (g_rxBuffer.length() + chunkLength > vibe::kRpcBufferLength) {
-            Serial.println("RPC request too large");
-            g_rxBuffer = "";
-            return;
-        }
-
-        for (std::size_t i = 0; i < chunkLength; ++i) {
-            g_rxBuffer += static_cast<char>(data[i + 2]);
-        }
-
-        JsonDocument probe;
-        const DeserializationError parseResult = deserializeJson(probe, g_rxBuffer);
-        if (parseResult == DeserializationError::IncompleteInput) {
-            return;
-        }
-        if (parseResult) {
-            Serial.printf("Discarding malformed RPC: %s\n", parseResult.c_str());
-            g_rxBuffer = "";
-            return;
-        }
-
-        auto* message = static_cast<char*>(std::malloc(g_rxBuffer.length() + 1));
-        if (message == nullptr) {
-            Serial.println("RPC allocation failed");
-            g_rxBuffer = "";
-            return;
-        }
-        std::memcpy(message, g_rxBuffer.c_str(), g_rxBuffer.length());
-        message[g_rxBuffer.length()] = '\0';
-        if (xQueueSend(g_rpcQueue, &message, 0) != pdTRUE) {
-            Serial.println("RPC queue full");
-            std::free(message);
-        }
-        g_rxBuffer = "";
-    }
-};
-
-// Connection callbacks keep the UI synchronized with pairing state and resume
-// advertising automatically after a disconnect.
-class HidServerCallbacks : public NimBLEServerCallbacks {
-    void onConnect(NimBLEServer* server, NimBLEConnInfo& connection) override {
-        g_connected = true;
-        g_uiDirty = true;
-        server->updateConnParams(connection.getConnHandle(), 12, 24, 0, 180);
-        Serial.printf("BLE connected: %s\n", connection.getAddress().toString().c_str());
-    }
-
-    void onDisconnect(NimBLEServer*, NimBLEConnInfo&, int reason) override {
-        g_connected = false;
-        g_activeTouch = -1;
-        g_uiDirty = true;
-        Serial.printf("BLE disconnected: %d\n", reason);
-        NimBLEDevice::startAdvertising();
-    }
-
-    void onAuthenticationComplete(NimBLEConnInfo& connection) override {
-        if (!connection.isEncrypted()) {
-            Serial.println("BLE encryption failed");
-            NimBLEDevice::getServer()->disconnect(connection.getConnHandle());
-            return;
-        }
-        // Defer hardware feedback to Arduino's main loop; NimBLE owns this
-        // callback task and should only publish the successful result.
-        g_pairingSuccessPending = true;
-        Serial.println("BLE pairing authenticated");
-    }
-};
-
-RpcOutputCallbacks g_rpcCallbacks;
-HidServerCallbacks g_serverCallbacks;
-
-void addDeviceInfoCharacteristic(std::uint16_t uuid, const char* value) {
-    auto* characteristic = g_hid->getDeviceInfoService()->createCharacteristic(uuid, NIMBLE_PROPERTY::READ);
-    characteristic->setValue(value);
-}
-
-void initializeBle() {
-    // Expose standard keyboard/consumer/pointer reports plus the vendor report
-    // used for agent status, actions, and request/response messages.
-    NimBLEDevice::init(g_deviceName);
-    NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
-    NimBLEDevice::setSecurityAuth(true, false, true);
-
-    g_server = NimBLEDevice::createServer();
-    g_server->setCallbacks(&g_serverCallbacks);
-    g_hid = new NimBLEHIDDevice(g_server);
-
-    g_hid->setManufacturer(vibe::kManufacturer);
-    g_hid->setPnp(0x01, vibe::kVendorId, vibe::kProductId, vibe::kProductVersion);
-    g_hid->setHidInfo(0x00, 0x01);
-    g_hid->setReportMap(vibe::kReportMap, sizeof(vibe::kReportMap));
-
-    char serial[17];
-    std::snprintf(serial, sizeof(serial), "%016llX", ESP.getEfuseMac());
-    addDeviceInfoCharacteristic(0x2A24, vibe::kModelNumber);
-    addDeviceInfoCharacteristic(0x2A25, serial);
-    addDeviceInfoCharacteristic(0x2A26, vibe::kFirmwareVersion);
-
-    auto* keyboardInput = g_hid->getInputReport(1);
-    auto* consumerInput = g_hid->getInputReport(2);
-    auto* pointerInput = g_hid->getInputReport(3);
-    g_vendorInput = g_hid->getInputReport(vibe::kVendorReportId);
-    g_vendorOutput = g_hid->getOutputReport(vibe::kVendorReportId);
-    g_hid->getFeatureReport(vibe::kVendorReportId);
-
-    const std::uint8_t keyboardIdle[8] = {};
-    const std::uint8_t consumerIdle[2] = {};
-    const std::uint8_t pointerIdle[5] = {};
-    const std::uint8_t vendorIdle[vibe::kBleReportLength] = {};
-    keyboardInput->setValue(keyboardIdle, sizeof(keyboardIdle));
-    consumerInput->setValue(consumerIdle, sizeof(consumerIdle));
-    pointerInput->setValue(pointerIdle, sizeof(pointerIdle));
-    g_vendorInput->setValue(vendorIdle, sizeof(vendorIdle));
-    g_vendorOutput->setCallbacks(&g_rpcCallbacks);
-
-    updateBattery(false);
-    if (!g_server->start()) {
-        Serial.println("Failed to start BLE GATT server");
-        return;
-    }
-
-    auto* advertising = NimBLEDevice::getAdvertising();
-    advertising->setName(g_deviceName);
-    advertising->setAppearance(HID_KEYBOARD);
-    advertising->addServiceUUID(g_hid->getHidService()->getUUID());
-    advertising->enableScanResponse(true);
-    advertising->start();
-    Serial.printf("BLE HID advertising started as %s\n", g_deviceName);
+void initializeNetwork() {
+    // The device slot (#1-#3) now just names this watch on the network so
+    // the bridge can tell several watches apart.
+    char deviceId[24];
+    std::snprintf(deviceId, sizeof(deviceId), "vibe-watch-%d", g_deviceSlot);
+    voice::begin();
+    voice::setVolume(g_seVolume);
+    net::begin(deviceId, g_rpcQueue);
 }
 
 void beginPairing() {
-    // A slot is a separate advertised identity. Clear every stored bond before
-    // restarting so macOS discovers the selected slot with a clean GATT cache.
+    // "CONNECT" in Settings: save the chosen slot and restart so the watch
+    // rejoins Wi-Fi and the bridge under the new device id.
     saveDeviceSlot(g_pendingDeviceSlot);
-
-    if (g_server != nullptr) {
-        const auto peers = g_server->getPeerDevices();
-        for (const auto connectionHandle : peers) {
-            g_server->disconnect(connectionHandle);
-        }
-    }
-    NimBLEDevice::deleteAllBonds();
-
     g_connected = false;
     g_deviceSlot = g_pendingDeviceSlot;
     std::snprintf(g_deviceName, sizeof(g_deviceName), "%s%d", vibe::kDeviceNamePrefix, g_deviceSlot);
     g_restartAt = millis() + 900;
     g_uiDirty = true;
-    Serial.printf("Pairing requested for %s; restarting\n", g_deviceName);
+    Serial.printf("Reconnect requested for %s; restarting\n", g_deviceName);
 }
 
 // -----------------------------------------------------------------------------
@@ -848,6 +676,7 @@ void handleSettingsTouch(const m5::Touch_Class::touch_detail_t& touch) {
             beginPairing();
         } else if (g_activeTouch == kTouchVolume) {
             saveSeVolume();
+            voice::setVolume(g_seVolume);
             playSe(980.0f, 70);
         } else if (g_activeTouch == kTouchVibrationStrength) {
             saveFeedbackSettings();
@@ -1272,7 +1101,13 @@ void drawStatusBar() {
     if (g_restartAt != 0) {
         std::snprintf(status, sizeof(status), "RESTART  #%d", g_deviceSlot);
     } else {
-        std::snprintf(status, sizeof(status), "%s  #%d  %u%%%s", g_connected ? "ON" : "PAIR",
+        const char* link = g_connected ? "ON" : (net::wifiUp() ? "HOST" : "WIFI");
+        if (voice::isCapturing()) {
+            link = "REC";
+        } else if (voice::isSpeaking()) {
+            link = "SAY";
+        }
+        std::snprintf(status, sizeof(status), "%s  #%d  %u%%%s", link,
                       g_deviceSlot, g_batteryLevel, g_isCharging ? "+" : "");
     }
     M5.Display.setFont(&fonts::Orbitron_Light_24);
@@ -1295,7 +1130,7 @@ void renderSettingsUi() {
     M5.Display.setFont(&fonts::DejaVu18);
     M5.Display.setTextSize(0.78f);
     M5.Display.setTextColor(muted, TFT_BLACK);
-    M5.Display.drawString("BLUETOOTH DEVICE", kScreenCenter, 72);
+    M5.Display.drawString("WATCH ID", kScreenCenter, 72);
 
     M5.Display.fillCircle(kSettingsCloseX, kSettingsCloseY, kSettingsCloseRadius, panel);
     drawThickCircle(kSettingsCloseX, kSettingsCloseY, kSettingsCloseRadius, 3, panelBorder);
@@ -1324,7 +1159,7 @@ void renderSettingsUi() {
     drawThickRoundRect(153, 151, 160, 45, 22, pairPressed ? 5 : 3,
                        pairPressed ? TFT_WHITE : panelBorder);
     M5.Display.setTextColor(TFT_WHITE, pairFill);
-    M5.Display.drawString("PAIR", kScreenCenter, 173);
+    M5.Display.drawString("CONNECT", kScreenCenter, 173);
 
     M5.Display.setFont(&fonts::DejaVu18);
     M5.Display.setTextSize(0.82f);
@@ -1654,14 +1489,15 @@ void showSplashScreen() {
 // -----------------------------------------------------------------------------
 
 void setup() {
-    // Initialize hardware and local state before advertising the BLE HID. This
-    // ensures the first screen and battery report are valid when a host connects.
+    // Initialize hardware and local state before joining Wi-Fi. This ensures
+    // the first screen and battery report are valid when the bridge connects.
     Serial.begin(115200);
     delay(200);
 
     auto config = M5.config();
     config.clear_display = true;
     config.internal_spk = true;
+    config.internal_mic = true;
     M5.begin(config);
     M5.Display.setBrightness(80);
     M5.Display.setRotation(0);
@@ -1681,16 +1517,37 @@ void setup() {
     }
 
     renderUi(millis());
-    initializeBle();
+    initializeNetwork();
     g_uiDirty = true;
 }
 
 void loop() {
     // Keep input, host messages, deferred restart, haptics, battery updates, and
-    // rendering cooperative; no path should block long enough to starve BLE.
+    // rendering cooperative; no path should block long enough to starve Wi-Fi.
     M5.update();
+    net::loop();
+
+    // Mirror link state into the UI and reuse the pairing chime on connect.
+    const bool linkUp = net::connected();
+    if (linkUp != g_connected) {
+        g_connected = linkUp;
+        g_uiDirty = true;
+        if (linkUp) {
+            g_pairingSuccessPending = true;
+        } else {
+            g_activeTouch = -1;
+        }
+    }
+
     handleTouch();
     handlePhysicalButtons();
+    voice::loop();
+    static int lastVoiceState = 0;
+    const int voiceState = voice::isCapturing() ? 1 : (voice::isSpeaking() ? 2 : 0);
+    if (voiceState != lastVoiceState) {
+        lastVoiceState = voiceState;
+        g_uiDirty = true;
+    }
 
     char* message = nullptr;
     while (xQueueReceive(g_rpcQueue, &message, 0) == pdTRUE) {

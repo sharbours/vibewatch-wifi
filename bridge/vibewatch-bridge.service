@@ -1,0 +1,16 @@
+[Unit]
+Description=Vibe Watch <-> Hermes Agent voice bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/vibewatch-bridge
+ExecStart=/opt/vibewatch-bridge/.venv/bin/python /opt/vibewatch-bridge/hermes_bridge.py
+Restart=on-failure
+RestartSec=5
+# Run as the same user that runs `hermes gateway` if you like; any user works.
+User=root
+
+[Install]
+WantedBy=multi-user.target
