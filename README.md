@@ -3,11 +3,17 @@
 > **This fork:** Wi-Fi + voice chat with a self-hosted Hermes Agent instead of BLE + macOS. See [docs/HERMES_WIFI_SETUP.md](docs/HERMES_WIFI_SETUP.md).
 
 All credit goes to the originators that I forked this repo from, my additions are miniscule but I hope they help someone.
-(https://github.com/GOROman/vibewatch/actions/workflows/firmware.yml)
+(https://github.com/GOROman/vibewatch/)
+
+**This README is outdated, but it gets the general gist across. I've incorporated multiple patches from other vibewatch repos, but the main changes are:
+
+**wi-fi instead of bluetooth
+
+**Swipable 'cards' for multiple Hermes 'groups'
+
+**Over-The-Air updates as a quality of life improvement
 
 **A wearable, tactile control surface for AI-assisted Vibe Coding—built around the M5Stack StopWatch.**
-
-This README is outdated, but it gets the general gist across. I've incorporated multiple patches from other vibewatch repos, but the main change was to get this working over wi-fi instead of bluetooth, and attempt to keep the battery life still usable. Additionally, it supports multiple hermes swipable 'cards', and hermes statistics on tokens used per instance, etc. There is also an over the air update feature as a quality of life improvement.
 
 ## One Glance. One Action. Stay in the Flow.
 
