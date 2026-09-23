@@ -199,6 +199,51 @@ python3 -m platformio device monitor              # watch the log
 
 The ESP32-S3 only does 2.4 GHz Wi-Fi — make sure your SSID has a 2.4 GHz band.
 
+## Updating the firmware over Wi-Fi
+
+After **one** USB flash of a build that has `VIBE_OTA_PASSWORD` set in
+`include/secrets.h`, the watch accepts new firmware over Wi-Fi (ArduinoOTA).
+Without that define, Wi-Fi updates are switched off entirely.
+
+### Building and uploading from the Proxmox container
+
+```bash
+# once, as the hermes user
+python3 -m venv ~/.pio-venv && ~/.pio-venv/bin/pip install platformio
+echo 'export PATH="$HOME/.pio-venv/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
+echo "export VIBE_OTA_PASSWORD='<same as in secrets.h>'" >> ~/.bashrc && source ~/.bashrc
+# include/secrets.h is git-ignored: copy it over from the PC you first flashed from
+```
+
+Every update after that:
+
+```bash
+cd ~/.hermes/code/vibewatch-wifi
+git pull
+pio run -e m5stack-stopwatch-ota -t upload --upload-port <watch IP>
+```
+
+- **Watch IP**: shown in the bridge log (`Watch vibe-watch-1 connected from ('192.168.0.x', …)`)
+  and on the serial monitor at boot (`OTA ready: …`). Giving the watch a DHCP reservation in
+  your router keeps it stable. `vibe-watch-1.local` also works where mDNS resolves, which
+  often isn't the case inside an LXC container.
+- **Firewall**: the watch connects *back* to the uploading machine on **TCP 3233**. If the
+  Proxmox firewall is on for the container, allow TCP 3233 in from your LAN.
+- The first `pio run` in the container downloads the ESP32 toolchain (several hundred MB).
+
+### What the watch does
+
+- The screen wakes and shows **UPDATING** with a progress ring; the mic and speaker stop.
+  Wi-Fi power saving is turned off for the transfer.
+- The new image goes into the *other* app slot. If the transfer is interrupted or fails its
+  check, the watch shows **UPDATE FAILED** and keeps running the old firmware.
+- On success it shows **RESTARTING** and boots the new firmware. The bridge reconnects it
+  automatically, and any approval that was open is shown again.
+- The password is checked with a challenge/response, but the image itself travels
+  unencrypted, so only do this on your own LAN.
+- There's no automatic rollback if the *new* firmware crashes at boot. If that ever happens,
+  flash over USB as the first time.
+
 ## Notes and limits
 
 - The mic and speaker share the codec’s I2S clock pins, so the watch is half-duplex:

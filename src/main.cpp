@@ -12,6 +12,7 @@
 #include <string>
 
 #include "net_link.h"
+#include "ota.h"
 #include "sound.h"
 #include "vibe_approval.h"
 #include "secrets.h"
@@ -1964,6 +1965,71 @@ void statusLoop(std::uint32_t now) {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Firmware update over Wi-Fi. The main loop is paused while ArduinoOTA
+// receives the image, so these hooks draw directly.
+// -----------------------------------------------------------------------------
+
+void drawOtaScreen(std::uint8_t pct, const char* title, const char* detail, std::uint16_t color) {
+    M5.Display.startWrite();
+    M5.Display.fillScreen(TFT_BLACK);
+    fillGaugeArc(226, 208, kGaugeStartDeg, kGaugeSweepDeg, M5.Display.color565(34, 38, 48));
+    fillGaugeArc(226, 208, kGaugeStartDeg, kGaugeSweepDeg * pct / 100.0f, color);
+    M5.Display.setTextDatum(middle_center);
+    M5.Display.setFont(&fonts::Orbitron_Light_24);
+    M5.Display.setTextSize(0.8f);
+    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+    M5.Display.drawString(title, kScreenCenter, 150);
+    char big[8];
+    std::snprintf(big, sizeof(big), "%u%%", static_cast<unsigned>(pct));
+    M5.Display.setFont(&fonts::Orbitron_Light_32);
+    M5.Display.setTextSize(1.3f);
+    M5.Display.drawString(big, kScreenCenter, kScreenCenter + 6);
+    M5.Display.setFont(&fonts::DejaVu18);
+    M5.Display.setTextSize(0.85f);
+    M5.Display.setTextColor(M5.Display.color565(180, 188, 205), TFT_BLACK);
+    M5.Display.drawString(detail, kScreenCenter, 312);
+    M5.Display.endWrite();
+}
+
+void otaStart() {
+    voice::stopAll();                 // frees I2S and the reply buffer
+    g_approvals.cancel(millis());     // bridge re-sends it after the reboot
+    g_approvalShownAt = 0;
+    g_statusOpen = false;
+    g_settingsOpen = false;
+    g_power.noteSystemActivity(millis());
+    applyPowerState(vibe::PowerState::Active);  // full CPU speed, screen on, Wi-Fi awake
+    playSe(880.0f, 60);
+    vibrate(150, 40);
+    drawOtaScreen(0, "UPDATING", "don't power off", M5.Display.color565(51, 196, 232));
+}
+
+void otaProgress(std::uint8_t pct) {
+    if (pct % 2 == 0) {  // a full redraw every 2% is plenty
+        drawOtaScreen(pct, "UPDATING", "don't power off", M5.Display.color565(51, 196, 232));
+    }
+}
+
+void otaEnd() {
+    drawOtaScreen(100, "RESTARTING", "new firmware installed", M5.Display.color565(66, 232, 139));
+    playOuterActionPressSe(kOkAction);
+}
+
+void otaError(const char* reason) {
+    drawOtaScreen(0, "UPDATE FAILED", reason, M5.Display.color565(245, 90, 104));
+    playOuterActionPressSe(kNgAction);
+    vibrate(200, 80);
+    delay(2500);
+    g_uiDirty = true;  // back to normal on the old firmware
+}
+
+void initializeOta() {
+    char hostname[24];
+    std::snprintf(hostname, sizeof(hostname), "vibe-watch-%d", g_deviceSlot);
+    ota::begin(hostname, ota::Hooks{otaStart, otaProgress, otaEnd, otaError});
+}
+
 void renderUi(std::uint32_t now) {
     // Redraw the small round display as one frame. The UI is simple enough that
     // full-frame painting avoids stale pixels when switching between layers.
@@ -2286,6 +2352,7 @@ void setup() {
 
     renderUi(millis());
     initializeNetwork();
+    initializeOta();
     g_uiDirty = true;
 }
 
@@ -2294,6 +2361,7 @@ void loop() {
     // rendering cooperative; no path should block long enough to starve Wi-Fi.
     M5.update();
     net::loop();
+    ota::loop();
 
     // Mirror link state into the UI and reuse the pairing chime on connect.
     const bool linkUp = net::connected();

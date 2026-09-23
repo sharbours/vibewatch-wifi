@@ -220,6 +220,14 @@ void releaseToTalk() {
     }
 }
 
+void stopAll() {
+    s_pending = false;
+    if (s_capturing) {
+        finishCapture();
+    }
+    stopPlayback();
+}
+
 bool isCapturing() {
     return s_capturing || s_pending;
 }

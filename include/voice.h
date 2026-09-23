@@ -20,6 +20,9 @@ void loop();
 void pressToTalk(int agentSlot, int profile);
 void releaseToTalk();
 
+// Abort everything audio (used before a firmware update).
+void stopAll();
+
 bool isCapturing();
 bool isSpeaking();
 void setVolume(std::uint8_t volume);
