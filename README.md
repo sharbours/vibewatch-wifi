@@ -5,15 +5,15 @@
 All credit goes to the originators that I forked this repo from, my additions are miniscule but I hope they help someone.
 (https://github.com/GOROman/vibewatch/)
 
-##This README is outdated, but it gets the general gist across. I've incorporated multiple patches from other vibewatch repos, but the main changes are:
+## This README is outdated, but it gets the general gist across. I've incorporated multiple patches from other vibewatch repos, but the main changes are:
 
-##wi-fi instead of bluetooth
+## Wi-Fi instead of Bluetooth
 
-##Swipable 'cards' for multiple Hermes 'groups'
+## Swipable 'cards' for multiple Hermes 'groups'
 
-##Over-The-Air updates as a quality of life improvement
+## Over-The-Air updates as a quality of life improvement
 
-##A wearable, tactile control surface for AI-assisted Vibe Coding—built around the M5Stack StopWatch.**
+## A wearable, tactile control surface for AI-assisted Vibe Coding—built around the M5Stack StopWatch.**
 
 ## One Glance. One Action. Stay in the Flow.
 
