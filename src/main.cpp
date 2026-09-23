@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -184,6 +185,24 @@ constexpr int kStatusRingInner = 223;
 constexpr float kGaugeStartDeg = 115.0f;   // 0 deg = 3 o'clock, clockwise
 constexpr float kGaugeSweepDeg = 310.0f;   // gap at the bottom for the status bar
 
+// Hermes profiles: swipe left/right on the agent screen to switch. Idea from
+// neilshare/vibewatch's swipeable agent cards (MIT). The watch remembers the
+// choice; the bridge supplies names, colours, and "needs attention" flags.
+constexpr int kMaxProfiles = 4;
+constexpr int kSwipeStartPx = 28;   // movement that turns a tap into a swipe
+constexpr int kSwipeMinPx = 70;     // horizontal distance needed to switch
+constexpr char kProfileKey[] = "profile";
+int g_profileIndex = 0;
+int g_profileCount = 1;
+char g_profileNames[kMaxProfiles][12] = {};
+std::uint32_t g_profileColors[kMaxProfiles] = {0x9D74FF, 0x33C4E8, 0xFFAC28, 0x42E88B};
+std::uint8_t g_profileAttention[kMaxProfiles] = {};
+std::uint32_t g_profileToastUntil = 0;
+int g_pendingAgentTap = -1;
+bool g_swipeTracking = false;
+bool g_swiping = false;
+int g_approvalProfile = 0;
+
 std::array<int, kAgentCount> agentX{};
 std::array<int, kAgentCount> agentY{};
 std::array<int, kActionCount> actionX{};
@@ -200,6 +219,7 @@ void loadPreferences() {
     g_seVolume = preferences.getUChar(kSeVolumeKey, 128);
     g_vibrationStrength = preferences.getUChar(kVibrationStrengthKey, 255);
     g_agentStateVibeEnabled = preferences.getBool(kAgentStateVibeKey, true);
+    g_profileIndex = std::min<int>(preferences.getUChar(kProfileKey, 0), kMaxProfiles - 1);
     preferences.end();
     if (g_deviceSlot < 1 || g_deviceSlot > 3) {
         g_deviceSlot = 1;
@@ -268,7 +288,8 @@ float effectBrightness(int effect, float brightness, float speed, std::uint32_t 
 }
 
 bool uiIsAnimated() {
-    if (g_selectionAnimating || g_approvalShownAt != 0) {
+    if (g_selectionAnimating || g_approvalShownAt != 0 ||
+        static_cast<std::int32_t>(millis() - g_profileToastUntil) < 0) {
         return true;
     }
     for (const auto& state : g_agents) {
@@ -325,11 +346,11 @@ void sendKeyEvent(const char* key, bool pressed) {
     }
     // Same {"m":"v.oai.hid"} event the Codex host expected, plus the currently
     // selected agent so the bridge knows which Hermes session it applies to.
-    char payload[96];
+    char payload[128];
     const int written = std::snprintf(
         payload, sizeof(payload),
-        "{\"m\":\"v.oai.hid\",\"p\":{\"k\":\"%s\",\"act\":%u,\"slot\":%d}}", key,
-        pressed ? 1U : 0U, g_selectedAgent);
+        "{\"m\":\"v.oai.hid\",\"p\":{\"k\":\"%s\",\"act\":%u,\"slot\":%d,\"profile\":%d}}", key,
+        pressed ? 1U : 0U, g_selectedAgent, g_profileIndex);
     if (written < 0 || written >= static_cast<int>(sizeof(payload))) {
         Serial.println("HID event payload overflow");
         return;
@@ -355,7 +376,7 @@ void sendMicEvent(bool pressed) {
     // dictation. Here the watch records its own microphone and streams PCM
     // to the bridge, which runs speech-to-text before calling Hermes.
     if (pressed) {
-        voice::pressToTalk(g_selectedAgent);
+        voice::pressToTalk(g_selectedAgent, g_profileIndex);
     } else {
         voice::releaseToTalk();
     }
@@ -487,6 +508,7 @@ void applyApprovalRequest(JsonVariantConst params) {
         return;
     }
     if (result == vibe::ApprovalAcceptResult::Accepted) {
+        g_approvalProfile = params["profile"] | g_profileIndex;
         Serial.printf("Approval request %.8s slot=%d: %s\n", request.id, request.slot + 1,
                       request.title);
     }
@@ -498,6 +520,86 @@ void applyApprovalCancel(JsonVariantConst params) {
         hideApproval();
         Serial.println("Approval withdrawn by host");
     }
+}
+
+// -----------------------------------------------------------------------------
+// Profiles
+// -----------------------------------------------------------------------------
+
+void sendProfileSelect() {
+    char json[64];
+    const int n = std::snprintf(json, sizeof(json),
+        "{\"m\":\"profile.select\",\"p\":{\"index\":%d}}", g_profileIndex);
+    net::sendText(json, n);
+}
+
+void setProfile(int index, bool feedback) {
+    if (index < 0 || index >= g_profileCount) {
+        return;
+    }
+    g_profileIndex = index;
+    Preferences preferences;
+    preferences.begin(kPreferencesNamespace, false);
+    preferences.putUChar(kProfileKey, static_cast<std::uint8_t>(index));
+    preferences.end();
+    // Never show the previous profile's LEDs or numbers as if they were this
+    // one's; the bridge repaints both immediately after profile.select.
+    for (auto& agent : g_agents) {
+        agent.brightness = 0.0f;
+        agent.effect = 0;
+    }
+    g_hostStatus = vibe::HostStatus{};
+    sendProfileSelect();
+    g_profileToastUntil = millis() + 900;
+    if (feedback) {
+        playSe(1150.0f, 45);
+        vibrate(120, 30);
+    }
+    g_uiDirty = true;
+}
+
+void switchProfile(int delta) {
+    if (g_profileCount <= 1) {
+        vibrate(40, 15);  // nothing to switch to: tiny bump
+        return;
+    }
+    setProfile((g_profileIndex + delta + g_profileCount) % g_profileCount, true);
+}
+
+void applyProfileList(JsonVariantConst params) {
+    JsonArrayConst names = params["names"].as<JsonArrayConst>();
+    int count = 0;
+    for (JsonVariantConst name : names) {
+        if (count >= kMaxProfiles) break;
+        vibe::copyUtf8(g_profileNames[count], sizeof(g_profileNames[count]), name | "");
+        ++count;
+    }
+    g_profileCount = std::max(1, count);
+    int i = 0;
+    for (JsonVariantConst color : params["colors"].as<JsonArrayConst>()) {
+        if (i >= kMaxProfiles) break;
+        g_profileColors[i] = color | g_profileColors[i];
+        ++i;
+    }
+    bool newAttention = false;
+    i = 0;
+    for (JsonVariantConst att : params["attention"].as<JsonArrayConst>()) {
+        if (i >= kMaxProfiles) break;
+        const std::uint8_t value = att | 0;
+        if (i != g_profileIndex && value > g_profileAttention[i]) {
+            newAttention = true;  // something happened on a profile you can't see
+        }
+        g_profileAttention[i++] = value;
+    }
+    if (newAttention) {
+        vibrate(150, 40);
+    }
+    if (g_profileIndex >= g_profileCount) {
+        setProfile(0, false);  // saved profile no longer exists
+    } else if ((params["active"] | 0) != g_profileIndex) {
+        sendProfileSelect();   // the watch's choice wins after a reconnect
+    }
+    g_uiDirty = true;
 }
 
 void applyHostStatus(JsonVariantConst params) {
@@ -544,6 +646,8 @@ void processRpc(const char* json) {
         applyAmbientStatus(params);
     } else if (std::strcmp(method, "host.focused_app") == 0) {
         applyFocusedApp(params);
+    } else if (std::strcmp(method, "profile.list") == 0) {
+        applyProfileList(params);
     } else if (std::strcmp(method, "host.status") == 0) {
         applyHostStatus(params);
     } else if (std::strcmp(method, "approval.request") == 0) {
@@ -828,17 +932,23 @@ void handleTouch() {
         // Remember the layer from touch-down through touch-up. A layer change
         // during the gesture must not release a different host-side control.
         g_touchActionLayer = g_actionLayer;
+        g_swipeTracking = !g_touchActionLayer && g_activeTouch < kAgentCount;  // agent or empty
+        g_swiping = false;
+        g_pendingAgentTap = -1;
         if (g_activeTouch >= 0 && g_activeTouch < kAgentCount) {
             if (g_touchActionLayer) {
                 g_selectedAction = g_activeTouch;
                 sendOuterActionEvent(g_activeTouch, true);
                 playOuterActionPressSe(g_activeTouch);
             } else {
-                selectAgent(g_activeTouch);
-                sendAgentEvent(g_activeTouch, true);
-                playSe(820.0f + g_activeTouch * 55.0f);
+                // Decided on release: a tap selects the agent, a swipe
+                // switches profile and must not fire the agent.
+                g_pendingAgentTap = g_activeTouch;
+                g_activeTouch = -1;
             }
-            vibrate();
+            if (g_touchActionLayer) {
+                vibrate();
+            }
         } else if (g_activeTouch == kTouchMic) {
             // The center is always a dedicated PTT button. Send DOWN at the
             // touch edge so AI assistant starts listening immediately.
@@ -855,6 +965,32 @@ void handleTouch() {
             playSe(760.0f);
             vibrate(80, 20);
         }
+        g_uiDirty = true;
+    }
+
+    if (g_swipeTracking && touch.isPressed() && !g_swiping &&
+        std::abs(touch.x - touch.base_x) > kSwipeStartPx) {
+        g_swiping = true;
+        g_pendingAgentTap = -1;
+    }
+    if (touch.wasReleased() && g_swipeTracking) {
+        g_swipeTracking = false;
+        const int dx = touch.x - touch.base_x;
+        const int dy = touch.y - touch.base_y;
+        if (g_swiping) {
+            if (std::abs(dx) >= kSwipeMinPx && std::abs(dx) * 10 > std::abs(dy) * 13) {
+                switchProfile(dx < 0 ? 1 : -1);  // swipe left = next profile
+            }
+        } else if (g_pendingAgentTap >= 0) {
+            const int agent = g_pendingAgentTap;
+            selectAgent(agent);
+            sendAgentEvent(agent, true);
+            playSe(820.0f + agent * 55.0f);
+            vibrate();
+            sendAgentEvent(agent, false);
+        }
+        g_swiping = false;
+        g_pendingAgentTap = -1;
         g_uiDirty = true;
     }
 
@@ -1240,8 +1376,16 @@ void drawStatusBar() {
         } else if (voice::isSpeaking()) {
             link = "SAY";
         }
-        std::snprintf(status, sizeof(status), "%s  #%d  %u%%%s", link,
-                      g_deviceSlot, g_batteryLevel, g_isCharging ? "+" : "");
+        if (g_profileCount > 1) {
+            char name[7];
+            std::snprintf(name, sizeof(name), "%s", g_profileNames[g_profileIndex]);
+            for (char* c = name; *c; ++c) *c = static_cast<char>(std::toupper(static_cast<unsigned char>(*c)));
+            std::snprintf(status, sizeof(status), "%s  %s  %u%%%s", link, name,
+                          g_batteryLevel, g_isCharging ? "+" : "");
+        } else {
+            std::snprintf(status, sizeof(status), "%s  #%d  %u%%%s", link,
+                          g_deviceSlot, g_batteryLevel, g_isCharging ? "+" : "");
+        }
     }
     M5.Display.setFont(&fonts::Orbitron_Light_24);
     M5.Display.setTextSize(0.75f);
@@ -1406,8 +1550,13 @@ void drawApprovalOverlay(std::uint32_t now) {
     M5.Display.setTextColor(amber, TFT_BLACK);
     M5.Display.drawString("APPROVAL", kScreenCenter, 66);
 
-    char header[40];
-    std::snprintf(header, sizeof(header), "AGENT %d  [ %s ]", request->slot + 1, request->kind);
+    char header[48];
+    if (g_profileCount > 1) {
+        std::snprintf(header, sizeof(header), "%.8s - AGENT %d [ %s ]",
+                      g_profileNames[g_approvalProfile], request->slot + 1, request->kind);
+    } else {
+        std::snprintf(header, sizeof(header), "AGENT %d  [ %s ]", request->slot + 1, request->kind);
+    }
     M5.Display.setTextSize(0.55f);
     M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
     M5.Display.drawString(header, kScreenCenter, 104);
@@ -1528,6 +1677,9 @@ void approvalLoop(std::uint32_t now) {
         g_settingsOpen = false;
         g_statusOpen = false;
         g_actionLayer = false;
+        if (g_approvalProfile != g_profileIndex) {
+            setProfile(g_approvalProfile, false);  // jump to the profile that's asking
+        }
         selectAgent(request->slot);
         resetInputStateForModal();
         g_inputLockUntilRelease = M5.BtnA.isPressed() || M5.BtnB.isPressed() ||
@@ -1610,6 +1762,43 @@ void updatePower() {
         g_power.noteSystemActivity(now);
     }
     applyPowerState(g_power.update(now));
+}
+
+// Page dots at the top (amber = approval waiting, green = unheard reply) and a
+// short name toast after switching.
+void drawProfileIndicators(std::uint32_t now) {
+    if (g_profileCount > 1) {
+        const int spacing = 18;
+        const int x0 = kScreenCenter - (g_profileCount - 1) * spacing / 2;
+        for (int i = 0; i < g_profileCount; ++i) {
+            const int x = x0 + i * spacing;
+            std::uint16_t color = M5.Display.color565(110, 116, 132);
+            if (g_profileAttention[i] == 2) color = M5.Display.color565(255, 172, 54);
+            else if (g_profileAttention[i] == 1) color = M5.Display.color565(66, 232, 139);
+            if (i == g_profileIndex) {
+                M5.Display.fillCircle(x, 22, 6, scaledColor(g_profileColors[i], 1.0f));
+                M5.Display.drawCircle(x, 22, 7, TFT_WHITE);
+            } else if (g_profileAttention[i] != 0) {
+                M5.Display.fillCircle(x, 22, 5, color);
+            } else {
+                M5.Display.drawCircle(x, 22, 5, color);
+            }
+        }
+    }
+    if (static_cast<std::int32_t>(now - g_profileToastUntil) < 0 && g_profileCount > 1) {
+        const auto accent = scaledColor(g_profileColors[g_profileIndex], 1.0f);
+        const auto fill = M5.Display.color565(18, 20, 28);
+        M5.Display.fillRoundRect(kScreenCenter - 110, kScreenCenter - 32, 220, 64, 32, fill);
+        drawThickRoundRect(kScreenCenter - 110, kScreenCenter - 32, 220, 64, 32, 3, accent);
+        char name[12];
+        std::snprintf(name, sizeof(name), "%s", g_profileNames[g_profileIndex]);
+        for (char* c = name; *c; ++c) *c = static_cast<char>(std::toupper(static_cast<unsigned char>(*c)));
+        M5.Display.setTextDatum(middle_center);
+        M5.Display.setFont(&fonts::Orbitron_Light_24);
+        M5.Display.setTextSize(0.9f);
+        M5.Display.setTextColor(TFT_WHITE, fill);
+        M5.Display.drawString(name, kScreenCenter, kScreenCenter);
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -1924,6 +2113,7 @@ void renderUi(std::uint32_t now) {
     }
 
     if (!g_actionLayer) {
+        drawProfileIndicators(now);
         drawStatusBar();
     }
 
@@ -2112,6 +2302,7 @@ void loop() {
         g_uiDirty = true;
         if (linkUp) {
             g_pairingSuccessPending = true;
+            sendProfileSelect();
         } else {
             g_activeTouch = -1;
             // The bridge keeps the request and re-sends it on reconnect.

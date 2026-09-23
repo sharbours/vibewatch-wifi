@@ -74,6 +74,39 @@ Only runs started through the Runs API get interactive approvals. Hermes'
 `/v1/responses` and chat endpoints treat API clients as unattended and deny
 flagged commands outright, which is why the bridge now uses `/v1/runs`.
 
+## Profiles (swipe between Hermes instances)
+
+Hermes profiles are separate agents with their own port, memory, skills and
+config (`hermes profile create coding`). The bridge can talk to several; on the
+watch you **swipe left/right on the agent screen** to switch. Each profile has
+its own six agent slots, LEDs, status ring and token count.
+
+1. Give each profile an API server on its own port, in `~/.hermes/profiles/<name>/.env`:
+   ```
+   API_SERVER_ENABLED=true
+   API_SERVER_PORT=8643
+   API_SERVER_KEY=<another long random string>
+   ```
+   and run its gateway: `hermes -p coding gateway` (the default profile keeps 8642).
+2. In `bridge/.env`:
+   ```
+   HERMES_PROFILES=home=http://127.0.0.1:8642,coding=http://127.0.0.1:8643
+   HERMES_API_KEY_HOME=<default profile's API_SERVER_KEY>
+   HERMES_API_KEY_CODING=<coding profile's API_SERVER_KEY>
+   ```
+   Up to 4 profiles. Optional colours: `HERMES_COLOR_CODING=33C4E8`.
+
+On the watch:
+
+- Swipe left = next profile, right = previous. A chime, a buzz and a name toast confirm it; the choice is remembered across restarts.
+- Agent taps now fire on **release** (so a swipe that starts on an agent dot doesn't select it). The mic button still starts instantly.
+- Dots at the top show the profiles: the current one in its colour, **amber** = an approval is waiting there, **green** = an unheard reply. You get a buzz when something new happens on a profile you're not looking at.
+- The status bar shows the profile name instead of `#1`.
+- An approval from another profile switches the watch to that profile before showing the card, and the card header names it.
+- Switching clears the LEDs and status numbers until the bridge sends that profile's real ones, so you never see one profile's data under another's name.
+
+With `HERMES_PROFILES` unset nothing changes: one Hermes, same session names as before.
+
 ## Status ring
 
 A thin gauge runs around the edge of the agent screen, with a gap at the bottom
@@ -183,7 +216,8 @@ The ESP32-S3 only does 2.4 GHz Wi-Fi — make sure your SSID has a 2.4 GHz band.
 
 The approval state machine (`lib/vibe_approval`), the pop-up layout, the
 power-saving scheme (`lib/vibe_power`), and the status snapshot with stale
-detection (`lib/vibe_status`, from its `vibe_quota`) are adapted
+detection (`lib/vibe_status`, from its `vibe_quota`), and swiping between
+cards (here: Hermes profiles) are adapted
 from [neilshare/vibewatch](https://github.com/neilshare/vibewatch) (MIT), itself a
 fork of [GOROman/vibewatch](https://github.com/GOROman/vibewatch).
 

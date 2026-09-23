@@ -85,6 +85,15 @@ REJECT_TEXT = os.getenv("REJECT_TEXT", "No, don't do that. Stop and wait for my 
 APPROVAL_TTL_S = int(os.getenv("APPROVAL_TTL_S", "240"))
 APPROVAL_SPEAK = os.getenv("APPROVAL_SPEAK", "1") not in ("0", "false", "no")
 
+# Hermes profiles (swipe between them on the watch). Format:
+#   HERMES_PROFILES=home=http://127.0.0.1:8642,coding=http://127.0.0.1:8643
+# Keys: HERMES_API_KEY_HOME, HERMES_API_KEY_CODING (fallback HERMES_API_KEY).
+# Colours (optional): HERMES_COLOR_HOME=9D74FF
+# Unset = one profile using HERMES_URL / HERMES_API_KEY, as before.
+HERMES_PROFILES = os.getenv("HERMES_PROFILES", "").strip()
+MAX_PROFILES = 4
+PROFILE_PALETTE = [0x9D74FF, 0x33C4E8, 0xFFAC28, 0x42E88B]
+
 # Status ring / page on the watch
 STATUS_INTERVAL_S = int(os.getenv("STATUS_INTERVAL_S", "30"))
 DAILY_TOKEN_BUDGET = int(os.getenv("DAILY_TOKEN_BUDGET", "0"))  # 0 = no budget, ring stays full
@@ -180,11 +189,12 @@ class HermesRunError(RuntimeError):
 
 
 class Hermes:
-    def __init__(self) -> None:
+    def __init__(self, url: str = HERMES_URL, key: str = HERMES_KEY) -> None:
+        self.url = url
         self.http = httpx.AsyncClient(
-            base_url=HERMES_URL,
+            base_url=url.rstrip("/"),
             timeout=httpx.Timeout(60.0, connect=10.0),
-            headers={"Authorization": f"Bearer {HERMES_KEY}"},
+            headers={"Authorization": f"Bearer {key}"},
         )
 
     async def start_run(self, text: str, session_id: str, session_key: str, plan: bool) -> str:
@@ -297,12 +307,14 @@ class UsageLedger:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.day = datetime.now().astimezone().date().isoformat()
-        self.total = 0
+        self.totals: dict[str, int] = {}
         self.sessions: dict[str, int] = {}
         try:
             data = json.loads(path.read_text())
             if data.get("day") == self.day:
-                self.total = int(data.get("total", 0))
+                self.totals = {k: int(v) for k, v in data.get("totals", {}).items()}
+                if not self.totals and "total" in data:  # file from the single-profile version
+                    self.totals = {"hermes": int(data["total"])}
                 self.sessions = {k: int(v) for k, v in data.get("sessions", {}).items()}
         except (OSError, ValueError):
             pass
@@ -310,9 +322,9 @@ class UsageLedger:
     def _roll(self) -> None:
         today = datetime.now().astimezone().date().isoformat()
         if today != self.day:
-            self.day, self.total, self.sessions = today, 0, {}
+            self.day, self.totals, self.sessions = today, {}, {}
 
-    def add(self, session_id: str, usage: dict | None) -> None:
+    def add(self, profile: str, session_id: str, usage: dict | None) -> None:
         if not isinstance(usage, dict):
             return
         tokens = usage.get("total_tokens")
@@ -323,16 +335,16 @@ class UsageLedger:
         if tokens <= 0:
             return
         self._roll()
-        self.total += tokens
+        self.totals[profile] = self.totals.get(profile, 0) + tokens
         self.sessions[session_id] = self.sessions.get(session_id, 0) + tokens
         try:
-            self.path.write_text(json.dumps({"day": self.day, "total": self.total, "sessions": self.sessions}))
+            self.path.write_text(json.dumps({"day": self.day, "totals": self.totals, "sessions": self.sessions}))
         except OSError as exc:
             log.warning("could not save %s: %s", self.path, exc)
 
-    def today(self) -> int:
+    def today(self, profile: str) -> int:
         self._roll()
-        return self.total
+        return self.totals.get(profile, 0)
 
     def session(self, session_id: str) -> int:
         self._roll()
@@ -357,7 +369,32 @@ def find_key(obj, key: str):
 
 
 LEDGER = UsageLedger(USAGE_FILE)
-HERMES_SNAPSHOT: dict = {"health": None, "runs": None, "jobs": 0}
+
+
+@dataclass
+class Profile:
+    name: str
+    url: str
+    key: str
+    color: int
+    hermes: "Hermes | None" = None
+    snapshot: dict = field(default_factory=lambda: {"health": None, "runs": None, "jobs": 0})
+
+
+def load_profiles() -> list[Profile]:
+    if not HERMES_PROFILES:
+        return [Profile("hermes", HERMES_URL, HERMES_KEY, PROFILE_PALETTE[0])]
+    profiles: list[Profile] = []
+    for i, entry in enumerate(e for e in HERMES_PROFILES.split(",") if e.strip()):
+        name, _, url = entry.strip().partition("=")
+        name = re.sub(r"[^a-z0-9_-]", "", name.strip().lower())
+        if not name or not url or len(profiles) >= MAX_PROFILES:
+            raise SystemExit(f"Bad HERMES_PROFILES entry {entry!r} (max {MAX_PROFILES}, name=url)")
+        key = os.getenv(f"HERMES_API_KEY_{name.upper()}", HERMES_KEY)
+        raw_color = os.getenv(f"HERMES_COLOR_{name.upper()}", "")
+        color = int(raw_color, 16) if raw_color else PROFILE_PALETTE[i % 4]
+        profiles.append(Profile(name, url.strip(), key, color))
+    return profiles
 
 
 # ---------------------------------------------------------------------------
@@ -405,10 +442,11 @@ class Slot:
 class Device:
     device: str
     speech: Speech
-    hermes: Hermes
+    profiles: list[Profile]
     ws: ServerConnection | None = None
-    slots: list[Slot] = field(default_factory=lambda: [Slot() for _ in range(AGENT_COUNT)])
-    selected: int = 0
+    slots: list[Slot] = field(default_factory=list)  # AGENT_COUNT per profile, indexed by gid
+    active: int = 0      # profile shown on the watch
+    selected: int = 0    # gid = profile * AGENT_COUNT + slot
     plan_mode: bool = False
     recording: bool = False
     rec_slot: int = 0
@@ -416,6 +454,66 @@ class Device:
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     approval_queue: deque = field(default_factory=deque)
     approval_current: PendingApproval | None = None
+    last_attention: tuple = ()
+
+    def __post_init__(self) -> None:
+        self.slots = [Slot() for _ in range(len(self.profiles) * AGENT_COUNT)]
+
+    # -- profile / slot addressing -------------------------------------------
+
+    @property
+    def multi(self) -> bool:
+        return len(self.profiles) > 1
+
+    def gid(self, slot: int, profile: int | None = None) -> int:
+        p = self.active if profile is None else profile
+        p = min(max(p, 0), len(self.profiles) - 1)
+        return p * AGENT_COUNT + min(max(slot, 0), AGENT_COUNT - 1)
+
+    def prof(self, gid: int) -> Profile:
+        return self.profiles[gid // AGENT_COUNT]
+
+    def h(self, gid: int) -> "Hermes":
+        return self.prof(gid).hermes
+
+    def label(self, gid: int) -> str:
+        n = gid % AGENT_COUNT + 1
+        return f"{self.prof(gid).name} agent {n}" if self.multi else f"Agent {n}"
+
+    def attention(self) -> list[int]:
+        """Per profile: 2 = approval waiting, 1 = unheard reply, 0 = nothing."""
+        out = []
+        for p in range(len(self.profiles)):
+            gids = range(p * AGENT_COUNT, (p + 1) * AGENT_COUNT)
+            if any(self.approval_waiting_for(g) for g in gids):
+                out.append(2)
+            elif any(self.slots[g].unheard for g in gids):
+                out.append(1)
+            else:
+                out.append(0)
+        return out
+
+    async def push_profiles(self, force: bool = False) -> None:
+        att = tuple(self.attention())
+        if not force and att == self.last_attention:
+            return
+        self.last_attention = att
+        await self.send_json({"method": "profile.list", "params": {
+            "names": [p.name for p in self.profiles],
+            "colors": [p.color for p in self.profiles],
+            "active": self.active,
+            "attention": list(att),
+        }})
+
+    async def select_profile(self, index: int) -> None:
+        index = min(max(index, 0), len(self.profiles) - 1)
+        self.active = index
+        self.selected = self.gid(self.selected % AGENT_COUNT)
+        log.info("[%s] profile -> %s", self.device, self.profiles[index].name)
+        await self.push_profiles(force=True)
+        await self.push_status()
+        await self.push_host_status()
+        await self.show_label(self.profiles[index].name.capitalize())
 
     # -- outbound --------------------------------------------------------
 
@@ -443,37 +541,41 @@ class Device:
 
     async def push_status(self) -> None:
         params = []
-        for i, slot in enumerate(self.slots):
-            state = slot.state
-            if self.approval_waiting_for(i):
+        for i in range(AGENT_COUNT):
+            g = self.gid(i)
+            state = self.slots[g].state
+            if self.approval_waiting_for(g):
                 state = "approval"
             c, b, e, s = STATE_STYLE[state]
             params.append({"id": i, "c": c, "b": b, "e": e, "s": s})
         await self.send_json({"method": "v.oai.thstatus", "params": params})
+        await self.push_profiles()
 
     async def set_state(self, idx: int, state: str) -> None:
         self.slots[idx].state = state
         await self.push_status()
 
     async def push_host_status(self) -> None:
-        if HERMES_SNAPSHOT["health"] is None:
+        profile = self.profiles[self.active]
+        snap = profile.snapshot
+        if snap["health"] is None:
             return  # nothing measured yet: the watch keeps showing "no data"
-        today = LEDGER.today()
+        today = LEDGER.today(profile.name)
         remaining = 100.0
         if DAILY_TOKEN_BUDGET > 0:
             remaining = max(0.0, 100.0 * (1 - today / DAILY_TOKEN_BUDGET))
-        runs = HERMES_SNAPSHOT["runs"]
+        runs = snap["runs"]
         if runs is None:
-            runs = sum(1 for i in range(AGENT_COUNT) if self.busy(i))
+            runs = sum(1 for i in range(AGENT_COUNT) if self.busy(self.gid(i)))
         await self.send_json({"method": "host.status", "params": {
-            "health": HERMES_SNAPSHOT["health"],
+            "health": snap["health"],
             "runs": runs,
-            "jobs": HERMES_SNAPSHOT["jobs"],
+            "jobs": snap["jobs"],
             "tokens_today": today,
             "budget": DAILY_TOKEN_BUDGET,
             "remaining_pct": round(remaining, 1),
             "reset_s": seconds_to_local_midnight(),
-            "slot_tokens": [LEDGER.session(self.session_id(i)) for i in range(AGENT_COUNT)],
+            "slot_tokens": [LEDGER.session(self.session_id(self.gid(i))) for i in range(AGENT_COUNT)],
             "ttl_s": max(30, STATUS_INTERVAL_S * 3),
         }})
 
@@ -535,7 +637,7 @@ class Device:
         title, detail = approval_texts(event)
         pa = PendingApproval(request_id=rid, run_id=run_id, slot=slot, title=title, detail=detail)
         self.approval_queue.append(pa)
-        log.info("[%s] agent%d approval %s: %s | %s", self.device, slot + 1, rid[:8], title, detail)
+        log.info("[%s] %s approval %s: %s | %s", self.device, self.label(slot), rid[:8], title, detail)
         await self.pump_approvals()
         try:
             choice = await asyncio.wait_for(asyncio.shield(pa.future), timeout=APPROVAL_TTL_S + 30)
@@ -557,11 +659,12 @@ class Device:
         if pa is None:
             return
         await self.send_json({"m": "approval.request", "p": {
-            "id": pa.request_id, "slot": pa.slot, "kind": "EXEC",
+            "id": pa.request_id, "slot": pa.slot % AGENT_COUNT, "profile": pa.slot // AGENT_COUNT,
+            "profile_name": self.prof(pa.slot).name if self.multi else "", "kind": "EXEC",
             "title": pa.title, "detail": pa.detail, "ttl_ms": pa.ttl_ms(),
         }})
         if announce and APPROVAL_SPEAK:
-            asyncio.create_task(self.announce(f"Agent {pa.slot + 1} needs approval: {pa.title}."))
+            asyncio.create_task(self.announce(f"{self.label(pa.slot)} needs approval: {pa.title}."))
 
     async def on_approval_decision(self, rid: str, choice: str) -> None:
         pa = self.approval_current
@@ -606,7 +709,10 @@ class Device:
     # -- agent turns -------------------------------------------------------
 
     def session_id(self, idx: int) -> str:
-        return f"vibewatch-{self.device}-agent{idx + 1}-g{self.slots[idx].generation}"
+        n, gen = idx % AGENT_COUNT + 1, self.slots[idx].generation
+        if not self.multi:  # unchanged from the single-profile version
+            return f"vibewatch-{self.device}-agent{n}-g{gen}"
+        return f"vibewatch-{self.device}-{self.prof(idx).name}-agent{n}-g{gen}"
 
     def busy(self, idx: int) -> bool:
         t = self.slots[idx].task
@@ -615,7 +721,7 @@ class Device:
     def submit(self, idx: int, text: str) -> None:
         if self.busy(idx):
             log.info("[%s] agent%d busy; ignoring: %s", self.device, idx + 1, text)
-            asyncio.create_task(self.announce(f"Agent {idx + 1} is still working."))
+            asyncio.create_task(self.announce(f"{self.label(idx)} is still working."))
             return
         self.slots[idx].task = asyncio.create_task(self._turn(idx, text))
 
@@ -623,14 +729,14 @@ class Device:
         slot = self.slots[idx]
         try:
             await self.set_state(idx, "thinking")
-            log.info("[%s] agent%d <- %r", self.device, idx + 1, text)
-            slot.run_id = await self.hermes.start_run(
+            log.info("[%s] %s <- %r", self.device, self.label(idx), text)
+            slot.run_id = await self.h(idx).start_run(
                 text, self.session_id(idx), f"vibewatch:{self.device}", self.plan_mode)
             reply = await self.follow_run(idx, slot.run_id)
             if reply is None:
                 await self.set_state(idx, "idle")
                 return
-            log.info("[%s] agent%d -> %r", self.device, idx + 1, reply[:200])
+            log.info("[%s] %s -> %r", self.device, self.label(idx), reply[:200])
             slot.last_reply = reply
             if idx == self.selected and not self.recording and self.ws is not None:
                 # Speak outside this task so the slot accepts a new question
@@ -641,7 +747,7 @@ class Device:
                 await self.set_state(idx, "unheard")
         except asyncio.CancelledError:
             if slot.run_id:
-                await self.hermes.stop(slot.run_id)
+                await self.h(idx).stop(slot.run_id)
             await self.set_state(idx, "idle")
             raise
         except Exception as exc:  # noqa: BLE001
@@ -663,7 +769,7 @@ class Device:
 
         try:
             try:
-                async for ev in self.hermes.events(run_id):
+                async for ev in self.h(idx).events(run_id):
                     name = ev.get("event", "")
                     if name == "approval.request":
                         handle_approval(ev)
@@ -682,7 +788,7 @@ class Device:
 
             # Stream ended without a terminal event: poll the run status instead.
             while terminal is None:
-                st = await self.hermes.status(run_id)
+                st = await self.h(idx).status(run_id)
                 status = st.get("status")
                 if status in TERMINAL_STATUSES:
                     terminal = {"event": f"run.{status}", **st}
@@ -697,7 +803,7 @@ class Device:
                 await self.drop_approval(rid, notify_watch=True)
 
         name = terminal.get("event")
-        LEDGER.add(self.session_id(idx), terminal.get("usage"))
+        LEDGER.add(self.prof(idx).name, self.session_id(idx), terminal.get("usage"))
         await self.push_host_status()
         await self.show_label("Hermes")
         if name == "run.completed":
@@ -710,7 +816,7 @@ class Device:
         rid = str(event["request_id"])
         approve = await self.request_approval(idx, run_id, event)
         try:
-            await self.hermes.answer_approval(run_id, rid, approve)
+            await self.h(idx).answer_approval(run_id, rid, approve)
         except httpx.HTTPError as exc:
             log.warning("[%s] answering approval %s failed: %s", self.device, rid[:8], exc)
         await self.set_state(idx, "thinking" if approve else self.slots[idx].state)
@@ -741,17 +847,21 @@ class Device:
 
         if m == "hello":
             log.info("[%s] hello %s", self.device, p)
+            await self.push_profiles(force=True)
             await self.push_status()
-            ok = await self.hermes.health()
-            if ok and not await self.hermes.supports_approvals():
+            hermes = self.profiles[self.active].hermes
+            ok = await hermes.health()
+            if ok and not await hermes.supports_approvals():
                 log.warning("This Hermes build does not advertise run approvals; update Hermes.")
-            await self.show_label("Hermes" if ok else "Hermes offline")
+            await self.show_label(("Hermes" if not self.multi else self.profiles[self.active].name.capitalize())
+                                  if ok else "Hermes offline")
             await self.push_host_status()
             # Re-show an approval that was open when Wi-Fi dropped.
             await self.show_current_approval(announce=False)
         elif m == "voice.start":
             self.recording = True
-            self.rec_slot = int(p.get("slot", self.selected))
+            self.rec_slot = self.gid(int(p.get("slot", self.selected % AGENT_COUNT)),
+                                     int(p.get("profile", self.active)))
             self.selected = self.rec_slot
             self.rec_buf.clear()
             await self.set_state(self.rec_slot, "listening")
@@ -765,7 +875,11 @@ class Device:
         elif m == "approval.decision":
             await self.on_approval_decision(str(p.get("id", "")), str(p.get("choice", "")))
         elif m == "v.oai.hid":
-            await self.on_key(str(p.get("k", "")), bool(p.get("act")), int(p.get("slot", self.selected)))
+            await self.on_key(str(p.get("k", "")), bool(p.get("act")),
+                              self.gid(int(p.get("slot", self.selected % AGENT_COUNT)),
+                                       int(p.get("profile", self.active))))
+        elif m == "profile.select":
+            await self.select_profile(int(p.get("index", 0)))
         elif m == "device.battery":
             log.debug("[%s] battery %s", self.device, p)
 
@@ -786,7 +900,7 @@ class Device:
         if not pressed:
             return
         if key.startswith("AG"):
-            self.selected = int(key[2:])
+            self.selected = self.gid(int(key[2:]), slot // AGENT_COUNT)
             s = self.slots[self.selected]
             if s.unheard and s.last_reply:
                 asyncio.create_task(self.speak(self.selected, s.last_reply))
@@ -802,7 +916,7 @@ class Device:
             if self.busy(slot):
                 # Real cancel: Hermes stops the run at the next safe point.
                 if s.run_id:
-                    await self.hermes.stop(s.run_id)
+                    await self.h(slot).stop(s.run_id)
                 await self.send_json({"m": "tts.stop"})
             else:
                 self.submit(slot, REJECT_TEXT)
@@ -819,7 +933,7 @@ class Device:
             s.last_reply = ""
             s.unheard = False
             await self.set_state(slot, "idle")
-            await self.show_label(f"New chat {slot + 1}")
+            await self.show_label(f"New chat {slot % AGENT_COUNT + 1}")
 
     async def on_audio(self, data: bytes) -> None:
         if self.recording:
@@ -833,21 +947,25 @@ class Device:
 
 async def main() -> None:
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
-    if not WATCH_TOKEN or not HERMES_KEY:
-        raise SystemExit("Set WATCH_TOKEN and HERMES_API_KEY in bridge/.env")
+    if not WATCH_TOKEN or not (HERMES_KEY or HERMES_PROFILES):
+        raise SystemExit("Set WATCH_TOKEN and HERMES_API_KEY (or HERMES_PROFILES + keys) in bridge/.env")
 
     speech = Speech()
-    hermes = Hermes()
-    if not await hermes.health():
-        log.warning("Hermes API not reachable at %s yet (will keep trying per request)", HERMES_URL)
-    elif not await hermes.supports_approvals():
-        log.warning("Hermes at %s does not advertise run approvals; pop-ups won't appear", HERMES_URL)
+    profiles = load_profiles()
+    for prof in profiles:
+        prof.hermes = Hermes(prof.url, prof.key)
+        if not await prof.hermes.health():
+            log.warning("Hermes '%s' not reachable at %s yet (will keep trying)", prof.name, prof.url)
+        elif not await prof.hermes.supports_approvals():
+            log.warning("Hermes '%s' does not advertise run approvals; pop-ups won't appear", prof.name)
+    log.info("Profiles: %s", ", ".join(f"{p.name}={p.url}" for p in profiles))
 
     devices: dict[str, Device] = {}
 
     async def status_poller() -> None:
         while True:
-            HERMES_SNAPSHOT.update(await hermes.snapshot())
+            for prof in profiles:
+                prof.snapshot.update(await prof.hermes.snapshot())
             for dev in list(devices.values()):
                 await dev.push_host_status()
             await asyncio.sleep(STATUS_INTERVAL_S)
@@ -863,7 +981,7 @@ async def main() -> None:
         name = re.sub(r"[^a-zA-Z0-9_-]", "", headers.get("X-Vibe-Device", "vibe-watch")) or "vibe-watch"
         device = devices.get(name)
         if device is None:
-            device = devices[name] = Device(device=name, speech=speech, hermes=hermes)
+            device = devices[name] = Device(device=name, speech=speech, profiles=profiles)
         await device.attach(ws)
         log.info("Watch %s connected from %s", name, ws.remote_address)
         try:

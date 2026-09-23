@@ -38,6 +38,7 @@ volatile bool s_micTaskDone = true;
 bool s_pending = false;
 bool s_capturing = false;
 int s_slot = 0;
+int s_profile = 0;
 std::uint32_t s_captureStartedAt = 0;
 std::uint8_t s_volume = 180;
 
@@ -121,10 +122,10 @@ void startCaptureNow() {
     }
     xStreamBufferReset(s_stream);
 
-    char start[96];
+    char start[112];
     const int n = std::snprintf(start, sizeof(start),
-        "{\"m\":\"voice.start\",\"p\":{\"slot\":%d,\"rate\":%u,\"fmt\":\"s16le\"}}",
-        s_slot, static_cast<unsigned>(kMicRate));
+        "{\"m\":\"voice.start\",\"p\":{\"slot\":%d,\"profile\":%d,\"rate\":%u,\"fmt\":\"s16le\"}}",
+        s_slot, s_profile, static_cast<unsigned>(kMicRate));
     net::sendText(start, n);
 
     s_micRun = true;
@@ -199,12 +200,13 @@ void loop() {
     }
 }
 
-void pressToTalk(int agentSlot) {
+void pressToTalk(int agentSlot, int profile) {
     if (!net::connected()) {
         return;
     }
     stopPlayback();  // barge-in: talking over the reply cuts it off
     s_slot = agentSlot;
+    s_profile = profile;
     s_pending = true;
 }
 

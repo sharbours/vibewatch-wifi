@@ -17,7 +17,7 @@ void loop();
 
 // Push-to-talk edges. `agentSlot` (0-5) tells the bridge which Hermes
 // conversation the utterance belongs to.
-void pressToTalk(int agentSlot);
+void pressToTalk(int agentSlot, int profile);
 void releaseToTalk();
 
 bool isCapturing();
