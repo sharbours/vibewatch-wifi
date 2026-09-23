@@ -1,4 +1,4 @@
-# Vibe Watch
+# Vibe Watch Wi-Fi for Hermes
 
 > **This fork:** Wi-Fi + voice chat with a self-hosted Hermes Agent instead of BLE + macOS. See [docs/HERMES_WIFI_SETUP.md](docs/HERMES_WIFI_SETUP.md).
 
@@ -12,11 +12,8 @@ Created for the [M5Stack Global Innovation Contest 2026](https://m5stack.com/glo
 
 ![Vibe Watch worn on the wrist, showing its tactile Vibe Coding action interface](docs/images/vibe-watch-hero.jpg)
 
-## Video Demo
 
-[![Watch the Vibe Watch video demo](https://img.youtube.com/vi/Wta_rQDcs74/maxresdefault.jpg)](https://www.youtube.com/watch?v=Wta_rQDcs74)
-
-[Watch on YouTube](https://www.youtube.com/watch?v=Wta_rQDcs74)
+This README is outdated, but it gets the general gist across. I've incorporated multiple patches from other vibewatch repos, but the main change was to get this working over wi-fi instead of bluetooth, and attempt to keep the battery life still usable. Additionally, it supports multiple hermes swipable 'cards', and hermes statistics on tokens used per instance, etc.
 
 ## One Glance. One Action. Stay in the Flow.
 
